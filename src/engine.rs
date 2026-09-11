@@ -204,6 +204,8 @@ pub struct Engine {
     meter_order: Vec<(String, String)>,
     audio_ctl: AudioCtl,
     route: Mutex<AudioRoute>,
+    /// Objets maintenus en vie (flux de sortie CoreAudio) tant que le moteur existe.
+    _audio_keepalive: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
 }
 
 fn make(factory: &str) -> Result<gst::Element> {
@@ -305,16 +307,29 @@ impl Engine {
 
         // Graphe audio d'abord : le mélangeur d'habillage doit exister avant les vidéos,
         // dont le son s'y branche.
-        let (branding_mixer, audio_ctl, meter_order, route) = if cfg.audio.enabled {
+        let (branding_mixer, audio_ctl, meter_order, route, audio_keepalive) = if cfg.audio.enabled
+        {
             match Self::build_audio(&cfg, &pipeline) {
                 Ok(x) => x,
                 Err(e) => {
                     error!("audio désactivé : {e:#}");
-                    (None, AudioCtl::default(), Vec::new(), AudioRoute::default())
+                    (
+                        None,
+                        AudioCtl::default(),
+                        Vec::new(),
+                        AudioRoute::default(),
+                        Vec::new(),
+                    )
                 }
             }
         } else {
-            (None, AudioCtl::default(), Vec::new(), AudioRoute::default())
+            (
+                None,
+                AudioCtl::default(),
+                Vec::new(),
+                AudioRoute::default(),
+                Vec::new(),
+            )
         };
 
         let mut scenes = Vec::new();
@@ -373,6 +388,7 @@ impl Engine {
             meter_order,
             audio_ctl,
             route: Mutex::new(route),
+            _audio_keepalive: Mutex::new(audio_keepalive),
         });
         engine.spawn_bus_thread();
         Ok(engine)
@@ -626,12 +642,15 @@ impl Engine {
         AudioCtl,
         Vec<(String, String)>,
         AudioRoute,
+        Vec<Box<dyn std::any::Any + Send>>,
     )> {
         let a = &cfg.audio;
         let rate = a.sample_rate;
         let mut ctl = AudioCtl::default();
         let mut branding_mixer = None;
         let mut meters = Vec::new();
+        // Objets à garder en vie tant que le moteur tourne (flux CoreAudio de sortie).
+        let mut keepalives: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
         let mut route = AudioRoute {
             stream: a.stream_output_channels.clone(),
             branding: a.branding_output_channels.clone(),
@@ -641,13 +660,7 @@ impl Engine {
         };
 
         // ----- Sortie vers la carte son (Wing) -----
-        if let Some((sink, out_ch)) =
-            audio::make_device_element(&a.output_device, audio::Direction::Sink, a.output_channels)?
-        {
-            // `out_ch` est le nombre de canaux que macOS expose pour cette sortie (osxaudiosink
-            // négocie sur le format courant du périphérique). Un routage vers un canal au-delà
-            // est ignoré avec un avertissement : il faut alors augmenter le nombre de canaux USB
-            // de sortie de la carte (voir README), sinon ces canaux n'existent pas côté système.
+        if let Some((out_ch, sink_head, keepalive)) = Self::build_output_sink(pipeline, cfg)? {
             let max_route = a
                 .stream_output_channels
                 .iter()
@@ -657,20 +670,22 @@ impl Engine {
                 .unwrap_or(0) as i32;
             if max_route > out_ch {
                 warn!(
-                    "audio sortie « {} » : routage vers le canal {max_route} mais la carte n'expose \
-                     que {out_ch} sorties à macOS. Augmentez les canaux USB de sortie de la carte \
-                     (Audio MIDI Setup / config USB de la Wing).",
+                    "audio sortie « {} » : routage vers le canal {max_route} mais la sortie n'a \
+                     que {out_ch} canaux.",
                     a.output_device
                 );
+            }
+            if let Some(k) = keepalive {
+                keepalives.push(k);
             }
             ctl.out_channels = out_ch;
             route.out_channels = out_ch;
 
             let out_mixer = make("audiomixer")?;
-            let out_caps = capsfilter(&audio::raw_caps(rate, out_ch))?;
-            let out_q = audio_queue()?;
-            pipeline.add_many([&out_mixer, &out_caps, &out_q, &sink])?;
-            link_many(&[&out_mixer, &out_caps, &out_q, &sink])?;
+            pipeline.add(&out_mixer)?;
+            out_mixer
+                .link(&sink_head)
+                .context("liaison mélangeur sortie → sortie audio")?;
 
             // Branche STREAM (téléphone WebRTC) → canaux stream_output_channels.
             {
@@ -768,7 +783,102 @@ impl Engine {
             );
         }
 
-        Ok((branding_mixer, ctl, meters, route))
+        Ok((branding_mixer, ctl, meters, route, keepalives))
+    }
+
+    /// Construit la fin de la chaîne de sortie audio. Sur macOS avec une carte nommée, la
+    /// sortie passe par CoreAudio (cpal) car `osxaudiosink` se limite à 2 canaux : le graphe
+    /// produit du F32 entrelacé à N canaux, poussé dans un `appsink` vers le flux CoreAudio.
+    /// Retourne (nombre de canaux, élément d'entrée de la chaîne à relier au mélangeur,
+    /// objet à garder en vie).
+    #[allow(clippy::type_complexity)]
+    fn build_output_sink(
+        pipeline: &gst::Pipeline,
+        cfg: &Config,
+    ) -> Result<Option<(i32, gst::Element, Option<Box<dyn std::any::Any + Send>>)>> {
+        let a = &cfg.audio;
+        let rate = a.sample_rate;
+        let sel = a.output_device.trim();
+        if sel.is_empty() || sel.eq_ignore_ascii_case("none") {
+            return Ok(None);
+        }
+
+        #[cfg(target_os = "macos")]
+        if !sel.eq_ignore_ascii_case("default") {
+            match audio::cpal_out::best_config(sel) {
+                Ok((dev_ch, dev_rate)) => {
+                    let ch = if a.output_channels > 0 {
+                        a.output_channels
+                    } else {
+                        dev_ch as i32
+                    };
+                    let sr = dev_rate as i32;
+                    match audio::cpal_out::start(sel, ch as u16, sr as u32) {
+                        Ok(output) => {
+                            let caps = gst::Caps::builder("audio/x-raw")
+                                .field("format", "F32LE")
+                                .field("layout", "interleaved")
+                                .field("rate", sr)
+                                .field("channels", ch)
+                                .field("channel-mask", gst::Bitmask::new(0))
+                                .build();
+                            let convert = make("audioconvert")?;
+                            let resample = make("audioresample")?;
+                            let out_caps = capsfilter(&caps)?;
+                            let appsink = gst_app::AppSink::builder()
+                                .caps(&caps)
+                                .sync(false)
+                                .max_buffers(8)
+                                .drop(true)
+                                .build();
+                            let ring = output.ring.clone();
+                            let max_samples = (sr as usize) * (ch as usize) / 5; // ~200 ms
+                            appsink.set_callbacks(
+                                gst_app::AppSinkCallbacks::builder()
+                                    .new_sample(move |s| {
+                                        let sample =
+                                            s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                                        if let Some(buf) = sample.buffer() {
+                                            if let Ok(map) = buf.map_readable() {
+                                                let f: &[f32] =
+                                                    bytemuck::cast_slice(map.as_slice());
+                                                audio::cpal_out::push(&ring, f, max_samples);
+                                            }
+                                        }
+                                        Ok(gst::FlowSuccess::Ok)
+                                    })
+                                    .build(),
+                            );
+                            pipeline.add_many([
+                                &convert,
+                                &resample,
+                                &out_caps,
+                                appsink.upcast_ref(),
+                            ])?;
+                            link_many(&[&convert, &resample, &out_caps, appsink.upcast_ref()])?;
+                            info!("audio sortie « {sel} » via CoreAudio : {ch} canaux @ {sr} Hz");
+                            return Ok(Some((ch, convert, Some(Box::new(output)))));
+                        }
+                        Err(e) => {
+                            warn!("CoreAudio « {sel} » indisponible ({e:#}) ; repli GStreamer")
+                        }
+                    }
+                }
+                Err(e) => warn!("CoreAudio « {sel} » : {e:#} ; repli GStreamer"),
+            }
+        }
+
+        // Repli (autres plateformes, « default », ou CoreAudio indisponible) : sink GStreamer.
+        if let Some((sink, out_ch)) =
+            audio::make_device_element(sel, audio::Direction::Sink, a.output_channels)?
+        {
+            let out_caps = capsfilter(&audio::raw_caps(rate, out_ch))?;
+            let out_q = audio_queue()?;
+            pipeline.add_many([&out_caps, &out_q, &sink])?;
+            link_many(&[&out_caps, &out_q, &sink])?;
+            return Ok(Some((out_ch, out_caps, None)));
+        }
+        Ok(None)
     }
 
     /// Change à chaud les canaux d'une source audio (mix-matrix de l'`audioconvert`).

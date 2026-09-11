@@ -191,14 +191,13 @@ disponibles dans `GET /api/state`.
 - Un seul téléphone simultané (le canal « phone » est unique) ; plusieurs sources = plusieurs canaux à ajouter.
 - Les fichiers vidéo sont décodés par GStreamer et envoyés au GPU image par image (suffisant pour des overlays 1080p).
 - Pas d'enregistrement ni de streaming RTMP.
-- **Nombre de canaux de la carte son** : `streame` ouvre la carte au format que macOS expose
-  (osxaudiosink via CoreAudio). Si `streame devices` (ou le panneau audio) montre moins de canaux
-  de sortie que prévu — par exemple 2 alors que la Wing en a 8 — c'est que la carte ne présente
-  que ce nombre à macOS. Un routage vers un canal au-delà est ignoré avec un avertissement. Pour
-  débloquer les sorties 3/4 (ou plus), augmentez le nombre de canaux USB **de sortie** de la carte
-  (menu USB/Routing de la Wing, ou format de sortie dans Audio MIDI Setup). Une fois la carte à
-  8 sorties, `streame` les détecte automatiquement. Inutile de passer par une bibliothèque
-  CoreAudio dédiée : osxaudiosink *est* CoreAudio, la limite vient du format exposé par la carte.
+- **Sortie multicanal via CoreAudio (macOS)** : l'élément `osxaudiosink` de GStreamer se limite
+  à 2 canaux de sortie même quand la carte en expose plus. `streame` contourne cela en ouvrant la
+  sortie directement en CoreAudio (via cpal) : le graphe GStreamer assemble le flux entrelacé à N
+  canaux (habillage + stream déjà routés, avec les VU-mètres) et un `appsink` le pousse dans le
+  flux CoreAudio. Le nombre de canaux est détecté automatiquement (8 sur la Wing). L'entrée
+  (retour vers le téléphone) reste lue par GStreamer, qui gère bien le multicanal en entrée.
+  Pour `output_device = "default"`, la sortie repasse par GStreamer (stéréo, suffisant).
 - Le retour audio vers le téléphone est stéréo 48 kHz Opus ; l'annulation d'écho est faite côté téléphone.
 - Sur Chrome/Android, forcer `video_codec = "VP8"` si le H264 matériel n'est pas disponible.
 - La négociation active l'extension d'en-tête RTP *transport-wide-cc* : sans elle, l'estimation
