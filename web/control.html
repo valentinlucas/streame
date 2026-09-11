@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streame — contrôle</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<h1>🎛 Streame — contrôle</h1>
+<div class="bar">
+  <span id="phone" class="pill off">Téléphone : —</span>
+  <span id="link" class="pill">Connexion…</span>
+</div>
+<div id="scenes" class="scenes"></div>
+<div class="row">
+  <button id="take">TAKE (preview → programme)</button>
+</div>
+<p style="color:#888;font-size:.85rem">Clic : preview (vert). Double-clic : passer en programme (rouge) avec transition.
+API : <code>POST /api/program/&lt;id&gt;</code>, <code>/api/cut/&lt;id&gt;</code>, <code>/api/preview/&lt;id&gt;</code>, <code>/api/take</code>, <code>GET /api/state</code>.</p>
+<script src="/control.js"></script>
+</body>
+</html>

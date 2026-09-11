@@ -1,0 +1,48 @@
+[package]
+name = "streame"
+version = "0.1.0"
+edition = "2021"
+description = "Régie vidéo légère : caméra/son d'un téléphone en WebRTC → sortie HDMI d'un Mac, scènes, multiview, Stream Deck"
+license = "MIT"
+
+[dependencies]
+# GStreamer
+gst = { package = "gstreamer", version = "0.25" }
+gst-app = { package = "gstreamer-app", version = "0.25" }
+gst-video = { package = "gstreamer-video", version = "0.25" }
+gst-audio = { package = "gstreamer-audio", version = "0.25" }
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.25" }
+gst-sdp = { package = "gstreamer-sdp", version = "0.25" }
+
+# Serveur web + signaling
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+futures-util = "0.3"
+local-ip-address = "0.6"
+qrcode = { version = "0.14", default-features = false }
+
+# Fenêtres (sortie HDMI + multiview)
+winit = "0.30"
+softbuffer = "0.4"
+
+# Stream Deck
+elgato-streamdeck = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ab_glyph = "0.2"
+
+# Divers
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+debug = false

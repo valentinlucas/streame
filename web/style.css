@@ -1,0 +1,23 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #111; color: #eee; padding: 16px; }
+h1 { font-size: 1.3rem; margin: 0 0 12px; }
+label { display: block; margin: 10px 0 4px; font-size: .9rem; color: #bbb; }
+input, select, button { font: inherit; }
+input, select { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #444; background: #222; color: #eee; }
+button { padding: 14px 18px; border: 0; border-radius: 10px; background: #2b6cff; color: #fff; font-weight: 600; width: 100%; margin-top: 14px; }
+button.secondary { background: #444; }
+button:disabled { opacity: .5; }
+#status { margin-top: 12px; padding: 10px; border-radius: 8px; background: #222; font-size: .9rem; min-height: 40px; }
+video { width: 100%; background: #000; border-radius: 10px; margin-top: 12px; aspect-ratio: 16/9; object-fit: cover; }
+.row { display: flex; gap: 10px; }
+.row > * { flex: 1; }
+.scenes { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-top: 12px; }
+.scene { padding: 18px 10px; border-radius: 10px; background: #2a2a2a; border: 3px solid transparent; text-align: center; cursor: pointer; user-select: none; }
+.scene.program { border-color: #e02020; background: #4a1a1a; }
+.scene.preview { border-color: #20c040; }
+.scene small { display: block; color: #999; font-size: .75rem; margin-top: 4px; }
+.bar { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+.pill { padding: 6px 10px; border-radius: 999px; background: #333; font-size: .85rem; }
+.pill.on { background: #1e6b34; }
+.pill.off { background: #6b1e1e; }

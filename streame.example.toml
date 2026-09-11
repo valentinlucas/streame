@@ -1,0 +1,153 @@
+# Configuration Streame — voir README.md pour le détail des options.
+
+[server]
+bind = "0.0.0.0:8443"
+cert_dir = "certs"
+stun_server = "stun://stun.l.google.com:19302"
+rtc_latency_ms = 120
+video_codec = "H264"
+return_audio_bitrate = 64000
+
+[video]
+width = 1920
+height = 1080
+fps = 30
+mixer_latency_ms = 60
+
+[output]
+display = "HDMI"
+fullscreen = true
+
+[multiview]
+enabled = true
+width = 1280
+height = 720
+columns = 4
+display = ""
+
+[audio]
+enabled = true
+output_device = "WING"
+input_device = "WING"
+output_channels = 0
+input_channels = 0
+phone_to_output_channels = [
+    5,
+    6,
+]
+return_from_input_channels = [
+    1,
+    2,
+]
+sample_rate = 48000
+
+[transition]
+kind = "fade"
+duration_ms = 400
+
+[streamdeck]
+enabled = true
+serial = ""
+brightness = 60
+
+[[streamdeck.buttons]]
+index = 0
+action = "program"
+scene = "black"
+label = ""
+color = ""
+
+[[streamdeck.buttons]]
+index = 1
+action = "program"
+scene = "live"
+label = ""
+color = ""
+
+[[streamdeck.buttons]]
+index = 2
+action = "program"
+scene = "branding"
+label = ""
+color = ""
+
+[[streamdeck.buttons]]
+index = 3
+action = "program"
+scene = "overlay"
+label = ""
+color = ""
+
+[[streamdeck.buttons]]
+index = 4
+action = "take"
+scene = ""
+label = "TAKE"
+color = ""
+
+[[scenes]]
+id = "black"
+name = "Noir"
+
+[[scenes.layers]]
+kind = "color"
+color = "#000000"
+x = 0
+y = 0
+
+[[scenes]]
+id = "live"
+name = "Direct"
+
+[[scenes.layers]]
+kind = "phone"
+x = 0
+y = 0
+opacity = 1.0
+
+[[scenes]]
+id = "branding"
+name = "Habillage"
+
+[[scenes.layers]]
+kind = "phone"
+x = 0
+y = 0
+opacity = 1.0
+
+[[scenes.layers]]
+kind = "image"
+path = "assets/lower-third.png"
+x = 0
+y = 0
+opacity = 1.0
+
+[[scenes.layers]]
+kind = "text"
+text = "EN DIRECT"
+font = "Sans Bold 40"
+color = "#FFFFFF"
+x = 120
+y = 900
+width = 600
+height = 90
+
+[[scenes]]
+id = "overlay"
+name = "Overlay vidéo"
+
+[[scenes.layers]]
+kind = "phone"
+x = 0
+y = 0
+opacity = 1.0
+
+[[scenes.layers]]
+kind = "video"
+path = "assets/overlay.mp4"
+loop = true
+x = 1280
+y = 60
+width = 576
+height = 324
+opacity = 0.9
