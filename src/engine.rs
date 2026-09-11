@@ -629,6 +629,26 @@ impl Engine {
         self.scenes.iter().position(|s| s.id == id)
     }
 
+    fn scene_has_phone(&self, idx: usize) -> bool {
+        self.scenes
+            .get(idx)
+            .map(|s| s.layers.iter().any(|l| matches!(l.kind, LayerKind::Phone)))
+            .unwrap_or(false)
+    }
+
+    /// Le flux du téléphone est-il visible sur la sortie programme ? Vrai aussi pendant un
+    /// fondu si la scène qui s'efface contient le téléphone (elle reste à l'antenne).
+    pub fn phone_on_air(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        let mut on = self.scene_has_phone(st.program);
+        if let Some(t) = st.transition {
+            if t.progress() < 1.0 {
+                on = on || self.scene_has_phone(t.from);
+            }
+        }
+        on
+    }
+
     pub fn program_index(&self) -> usize {
         self.state.lock().unwrap().program
     }

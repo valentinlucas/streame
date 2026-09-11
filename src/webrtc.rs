@@ -56,6 +56,10 @@ pub enum ServerMsg {
     Error {
         message: String,
     },
+    /// Le flux du téléphone est-il diffusé sur la sortie programme du Mac.
+    OnAir {
+        on: bool,
+    },
 }
 
 /// Extension d'en-tête RTP « transport-wide congestion control ».

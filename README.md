@@ -20,9 +20,16 @@ téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôl
 
 ## Fonctionnalités
 
-- **Téléphone → Mac** : le téléphone ouvre `https://<ip-du-mac>:8443/`, choisit caméra/qualité et se connecte.
-  Vidéo H264 (ou VP8) + audio Opus en WebRTC, signaling par WebSocket, un seul téléphone à la fois
-  (une nouvelle connexion remplace la précédente).
+- **Téléphone → Mac** : le téléphone ouvre `https://<ip-du-mac>:8443/`. Écran de réglages
+  (nom, objectif de caméra, source audio, qualité) avec aperçu, puis écran direct épuré à
+  trois boutons (micro, son, quitter). Vidéo H264 (ou VP8) + audio Opus en WebRTC, un seul
+  téléphone à la fois (une nouvelle connexion remplace la précédente).
+- **Objectif et source audio** : la liste des caméras (les objectifs de l'iPhone : grand angle,
+  ultra grand angle, téléobjectif) et des entrées audio (micro intégré, AirPods…) est proposée
+  après autorisation. La capture est figée en 16:9 paysage ; une invite demande de tourner le
+  téléphone en portrait, et l'app s'installe en plein écran via « Sur l'écran d'accueil ».
+- **Retour « à l'antenne »** : quand le flux du téléphone est diffusé sur la sortie programme,
+  la page affiche un cadre rouge et un badge « À L'ANTENNE ».
 - **Retour audio** : les entrées choisies de la carte son sont renvoyées au téléphone (bidirectionnel).
 - **Composition GPU** : scènes, fondus et multiview rendus par wgpu (Metal sur macOS), à la
   fréquence de l'écran ; le décodage matériel (VideoToolbox) sort en NV12, converti dans le shader.

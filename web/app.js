@@ -6,7 +6,7 @@
   const liveStatus = (t) => { $('live-status').textContent = t; console.log('[streame]', t); };
 
   let ws, pc, stream, wakeLock, retryTimer, statsTimer, prevStats = null;
-  let live = false;        // true = direct en cours
+  let live = false;
   let wantConnected = false;
   let micOn = true, spkOn = true;
 
@@ -14,17 +14,18 @@
   function constraints() {
     const q = parseInt($('quality').value, 10);
     const dims = { 1080: [1920, 1080], 720: [1280, 720], 480: [854, 480] }[q] || [1280, 720];
+    const cam = $('camera').value;
     const micId = $('mic').value;
+    const video = Object.assign(
+      { width: { ideal: dims[0] }, height: { ideal: dims[1] }, aspectRatio: { ideal: 16 / 9 }, frameRate: { ideal: 30 } },
+      cam.startsWith('facing:') ? { facingMode: { ideal: cam.slice(7) } } : { deviceId: { exact: cam } },
+    );
     return {
       audio: Object.assign(
         { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         micId ? { deviceId: { exact: micId } } : {},
       ),
-      video: {
-        facingMode: { ideal: $('camera').value },
-        width: { ideal: dims[0] }, height: { ideal: dims[1] },
-        aspectRatio: { ideal: 16 / 9 }, frameRate: { ideal: 30 },
-      },
+      video,
     };
   }
 
@@ -33,21 +34,32 @@
   }
   function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
 
-  // ---- Liste des périphériques (caméras et sources audio) ---------------------------------
+  // ---- Périphériques : objectifs de caméra + sources audio --------------------------------
   async function refreshDevices() {
     let devs = [];
     try { devs = await navigator.mediaDevices.enumerateDevices(); } catch (e) { return; }
+    // Caméras : les libellés (« Caméra grand angle arrière », « ultra grand angle »…)
+    // n'apparaissent qu'après autorisation. Chaque objectif de l'iPhone est un périphérique.
+    const cams = devs.filter((d) => d.kind === 'videoinput');
+    const csel = $('camera'), ccur = csel.value;
+    csel.innerHTML = '<option value="facing:environment">Arrière</option><option value="facing:user">Avant</option>';
+    cams.forEach((d, i) => {
+      if (!d.label) return;
+      const o = document.createElement('option');
+      o.value = d.deviceId; o.textContent = d.label;
+      csel.appendChild(o);
+    });
+    if ([...csel.options].some((o) => o.value === ccur)) csel.value = ccur;
+
     const mics = devs.filter((d) => d.kind === 'audioinput');
-    const sel = $('mic');
-    const cur = sel.value;
-    sel.innerHTML = '<option value="">Micro par défaut</option>';
+    const msel = $('mic'), mcur = msel.value;
+    msel.innerHTML = '<option value="">Micro par défaut</option>';
     mics.forEach((d, i) => {
       const o = document.createElement('option');
-      o.value = d.deviceId;
-      o.textContent = d.label || `Micro ${i + 1}`;
-      sel.appendChild(o);
+      o.value = d.deviceId; o.textContent = d.label || `Micro ${i + 1}`;
+      msel.appendChild(o);
     });
-    if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+    if ([...msel.options].some((o) => o.value === mcur)) msel.value = mcur;
   }
 
   // ---- Aperçu (écran de réglages) ---------------------------------------------------------
@@ -75,9 +87,7 @@
   // ---- Passage en direct ------------------------------------------------------------------
   async function goLive() {
     if (!stream && !(await startPreview())) return;
-    wantConnected = true;
-    live = true;
-    micOn = true; spkOn = true;
+    wantConnected = true; live = true; micOn = true; spkOn = true;
     localStorage.setItem('streame-name', $('name').value);
     localStorage.setItem('streame-cam', $('camera').value);
     localStorage.setItem('streame-mic', $('mic').value);
@@ -86,28 +96,27 @@
     $('local').srcObject = stream;
     $('setup').hidden = true;
     $('live').hidden = false;
+    setOnAir(false);
     updateMuteButtons();
-    // Lecture du retour audio déclenchée pendant le geste utilisateur (exigé par iOS).
     $('remote').muted = false;
     $('remote').play().catch(() => {});
-    try { if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape'); } catch (e) { /* iOS : ignoré */ }
+    requestFullscreen(); // geste utilisateur : plein écran sur Android/desktop
     keepAwake();
     connectWs();
   }
 
   function endLive(message) {
-    wantConnected = false;
-    live = false;
+    wantConnected = false; live = false;
     clearInterval(statsTimer); prevStats = null;
     clearTimeout(retryTimer);
     if (ws) { try { send({ type: 'bye' }); ws.close(); } catch (e) { /* ignoré */ } ws = null; }
     if (pc) { pc.close(); pc = null; }
-    try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (e) { /* ignoré */ }
+    setOnAir(false);
     $('remote').muted = true;
     $('live').hidden = true;
     $('setup').hidden = false;
     setupStatus(message || 'Direct arrêté.');
-    startPreview(); // relance l'aperçu pour un nouveau départ
+    startPreview();
   }
 
   // ---- Signaling / WebRTC -----------------------------------------------------------------
@@ -120,6 +129,7 @@
       const msg = JSON.parse(ev.data);
       if (msg.type === 'offer') await onOffer(msg.sdp);
       else if (msg.type === 'ice') { try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex }); } catch (e) { console.warn(e); } }
+      else if (msg.type === 'on_air') setOnAir(msg.on);
       else if (msg.type === 'bye') { endLive('Session terminée par le Mac.'); }
       else if (msg.type === 'error') liveStatus('Erreur : ' + msg.message);
     };
@@ -143,7 +153,6 @@
       if (pc.connectionState === 'connected') statsTimer = setInterval(() => reportStats().catch(() => {}), 1000);
     };
     await pc.setRemoteDescription({ type: 'offer', sdp });
-    // Le Mac propose : audio (bidirectionnel) + vidéo (réception seule chez lui).
     for (const t of pc.getTransceivers()) {
       const kind = t.receiver.track ? t.receiver.track.kind : (t.mid === '0' ? 'audio' : 'video');
       const track = stream.getTracks().find((x) => x.kind === kind);
@@ -155,7 +164,6 @@
     await pc.setLocalDescription(answer);
     send({ type: 'answer', sdp: answer.sdp });
     liveStatus('Négociation…');
-    // Débit vidéo max (après setLocalDescription, sinon les encodings sont vides).
     for (const s of pc.getSenders()) {
       if (!s.track || s.track.kind !== 'video') continue;
       try {
@@ -170,7 +178,6 @@
     }
   }
 
-  // Statistiques de l'encodeur et du réseau, affichées ici et envoyées au Mac.
   async function reportStats() {
     if (!pc || pc.connectionState !== 'connected') return;
     let out = null, rtt = null, codecs = {};
@@ -194,6 +201,12 @@
     };
     send(st);
     liveStatus(`● ${st.width}x${st.height} · ${Math.round(st.fps)} i/s · ${(kbps / 1000).toFixed(1)} Mb/s` + (rtt != null ? ` · ${Math.round(rtt)} ms` : ''));
+  }
+
+  // ---- Retour « à l'antenne » -------------------------------------------------------------
+  function setOnAir(on) {
+    $('live').classList.toggle('onair-active', on);
+    $('onair').hidden = !on;
   }
 
   // ---- Boutons du direct ------------------------------------------------------------------
@@ -224,17 +237,40 @@
   $('start').onclick = () => goLive();
   $('enable').onclick = () => startPreview();
 
-  // Relance l'aperçu quand un réglage change.
+  // ---- Plein écran ------------------------------------------------------------------------
+  function isStandalone() {
+    return window.matchMedia('(display-mode: fullscreen)').matches || window.navigator.standalone === true;
+  }
+  async function requestFullscreen() {
+    try { if (!document.fullscreenElement && document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen({ navigationUI: 'hide' }); } catch (e) { /* ignoré */ }
+  }
+  $('fs').onclick = async () => {
+    if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch (e) { /* ignoré */ } return; }
+    if (document.documentElement.requestFullscreen) { requestFullscreen(); return; }
+    $('fs-hint').hidden = false; // iOS : pas d'API plein écran pour la page
+  };
+  if (isStandalone()) $('fs').hidden = true;
+  else if (!document.documentElement.requestFullscreen) $('fs-hint').hidden = false;
+
+  // ---- Verrouillage paysage (l'image ne dépend plus de l'orientation) ---------------------
+  const portraitMq = window.matchMedia('(orientation: portrait)');
+  const updateRotate = () => { $('rotate').hidden = !portraitMq.matches; };
+  portraitMq.addEventListener('change', updateRotate);
+  window.addEventListener('resize', updateRotate);
+  updateRotate();
+
+  // ---- Divers -----------------------------------------------------------------------------
   ['camera', 'mic', 'quality'].forEach((id) => { $(id).onchange = () => { if (!live) startPreview(); }; });
   navigator.mediaDevices.addEventListener('devicechange', () => { if (!live) refreshDevices(); });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && live) keepAwake(); });
 
-  // Restaure les derniers réglages puis lance l'aperçu.
   $('name').value = localStorage.getItem('streame-name') || '';
   if (localStorage.getItem('streame-cam')) $('camera').value = localStorage.getItem('streame-cam');
   if (localStorage.getItem('streame-q')) $('quality').value = localStorage.getItem('streame-q');
   startPreview().then(() => {
-    const m = localStorage.getItem('streame-mic');
-    if (m && [...$('mic').options].some((o) => o.value === m)) { $('mic').value = m; startPreview(); }
+    for (const [k, id] of [['streame-cam', 'camera'], ['streame-mic', 'mic']]) {
+      const v = localStorage.getItem(k);
+      if (v && [...$(id).options].some((o) => o.value === v)) $(id).value = v;
+    }
   });
 })();

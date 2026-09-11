@@ -62,6 +62,15 @@ pub async fn run(state: Shared, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Result<(
                 )
             }),
         )
+        .route(
+            "/manifest.webmanifest",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/manifest+json")],
+                    include_str!("../web/manifest.webmanifest"),
+                )
+            }),
+        )
         .route("/ws", get(phone_ws))
         .route("/ws/control", get(control_ws))
         .route("/api/state", get(api_state))
@@ -105,6 +114,7 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
     let mut session: Option<Arc<PhoneSession>> = None;
+    let mut events = state.engine.subscribe();
 
     loop {
         tokio::select! {
@@ -131,6 +141,7 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
                             Ok(s) => {
                                 *state.phone.lock().unwrap() = Some(s.clone());
                                 session = Some(s);
+                                let _ = tx.send(ServerMsg::OnAir { on: state.engine.phone_on_air() });
                             }
                             Err(e) => {
                                 warn!("session WebRTC : {e:#}");
@@ -165,6 +176,23 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
                         if sink.send(Message::Text(json.into())).await.is_err() { break; }
                     }
                     None => break,
+                }
+            }
+            ev = events.recv() => {
+                // Le programme a changé (ou le téléphone s'est (dé)connecté) : on informe la
+                // page de son état « à l'antenne ». Un second envoi après la durée du fondu
+                // capte la fin d'une transition (ex. la scène du téléphone qui s'efface).
+                if matches!(ev, Ok(Event::Program { .. }) | Ok(Event::Phone { .. })) {
+                    let _ = tx.send(ServerMsg::OnAir { on: state.engine.phone_on_air() });
+                    let dur = state.cfg.transition.duration_ms;
+                    if dur > 0 {
+                        let tx2 = tx.clone();
+                        let engine = state.engine.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(dur + 80)).await;
+                            let _ = tx2.send(ServerMsg::OnAir { on: engine.phone_on_air() });
+                        });
+                    }
                 }
             }
             _ = async {

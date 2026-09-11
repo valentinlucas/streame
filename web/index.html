@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="/manifest.webmanifest">
 <title>Streame — caméra</title>
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -12,7 +15,10 @@
 
 <!-- Écran de réglages, avant le démarrage du direct -->
 <section id="setup" class="screen">
-  <h1>📱 Streame</h1>
+  <div class="head">
+    <h1>📱 Streame</h1>
+    <button id="fs" class="ghost" title="Plein écran">⛶</button>
+  </div>
 
   <div class="preview-wrap">
     <video id="preview" autoplay muted playsinline></video>
@@ -22,10 +28,10 @@
   <label for="name">Nom</label>
   <input id="name" placeholder="iPhone de Valentin" autocomplete="off">
 
-  <label for="camera">Caméra</label>
+  <label for="camera">Caméra / objectif</label>
   <select id="camera">
-    <option value="environment">Arrière</option>
-    <option value="user">Avant</option>
+    <option value="facing:environment">Arrière</option>
+    <option value="facing:user">Avant</option>
   </select>
 
   <label for="mic">Source audio</label>
@@ -40,11 +46,13 @@
 
   <button id="start">Démarrer le direct</button>
   <div id="setup-status">Prêt.</div>
+  <p id="fs-hint" class="hint" hidden>Pour un vrai plein écran sur iPhone : partager → « Sur l'écran d'accueil », puis ouvrir depuis l'icône.</p>
 </section>
 
 <!-- Écran direct, une fois le stream lancé -->
 <section id="live" class="screen" hidden>
   <video id="local" autoplay muted playsinline></video>
+  <div id="onair" class="onair" hidden>● À L'ANTENNE</div>
   <div id="live-status" class="live-status">Connexion…</div>
   <div class="controls">
     <button id="mute" class="ctl"><span class="ico">🎙</span><span class="lbl">Micro</span></button>
@@ -52,6 +60,12 @@
     <button id="quit" class="ctl danger"><span class="ico">✕</span><span class="lbl">Quitter</span></button>
   </div>
 </section>
+
+<!-- Invite à tourner le téléphone : la capture reste ainsi toujours en paysage -->
+<div id="rotate" class="rotate" hidden>
+  <div class="rotate-ico">📱↻</div>
+  <div>Tournez le téléphone en paysage</div>
+</div>
 
 <audio id="remote" autoplay playsinline></audio>
 <script src="/app.js"></script>
