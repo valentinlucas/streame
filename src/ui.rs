@@ -198,14 +198,35 @@ impl App {
     fn redraw(&mut self, idx: usize) {
         if self.stats_at.elapsed() >= Duration::from_secs(1) {
             let st = self.engine.stats();
-            self.stats_text = if st.phone_width > 0 {
-                format!(
-                    "Tél. {}x{} {:.0} i/s · rendu {:.0} i/s",
-                    st.phone_width, st.phone_height, st.phone_fps, st.render_fps
-                )
-            } else {
-                format!("rendu {:.0} i/s", st.render_fps)
-            };
+            let mut parts = Vec::new();
+            if st.phone_width > 0 {
+                parts.push(format!(
+                    "Tél. {}x{} {:.0} i/s",
+                    st.phone_width, st.phone_height, st.phone_fps
+                ));
+            }
+            if let Some(r) = &st.rtp {
+                parts.push(format!("{} {:.1} Mb/s", r.codec, r.bitrate_kbps / 1000.0));
+                parts.push(format!(
+                    "perte {:.1}% gigue {:.0} ms NACK {} PLI {}",
+                    r.loss_percent, r.jitter_ms, r.nack_count, r.pli_count
+                ));
+                if let Some(rtt) = r.rtt_ms {
+                    parts.push(format!("RTT {rtt:.0} ms"));
+                }
+            }
+            if let Some(p) = &st.phone {
+                parts.push(format!(
+                    "envoi {}x{} {:.0} i/s {:.1} Mb/s limite:{}",
+                    p.width,
+                    p.height,
+                    p.fps,
+                    p.bitrate_kbps / 1000.0,
+                    p.quality_limitation
+                ));
+            }
+            parts.push(format!("rendu {:.0} i/s", st.render_fps));
+            self.stats_text = parts.join(" · ");
             self.stats_at = Instant::now();
         }
         let Some(renderer) = self.renderer.as_mut() else {

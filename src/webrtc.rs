@@ -1,11 +1,14 @@
 //! Session WebRTC avec le téléphone (un pipeline GStreamer par téléphone).
 //!
 //! Le Mac est l'« offreur » : il propose un flux audio bidirectionnel (retour vers le
-//! téléphone) et une réception vidéo. Les flux décodés sont poussés dans les canaux
-//! `intervideosink` / `interaudiosink` consommés par le moteur principal.
+//! téléphone) et une réception vidéo. La vidéo décodée est envoyée au rendu GPU via un
+//! `appsink`, l'audio au moteur principal via `interaudiosink`. Des statistiques RTP sont
+//! relevées chaque seconde (`get-stats`).
 
 use crate::config::Config;
-use crate::engine::{frame_appsink, Engine, PHONE_AUDIO_CHANNEL, RETURN_AUDIO_CHANNEL};
+use crate::engine::{
+    frame_appsink, Engine, PhoneStats, RtpStats, PHONE_AUDIO_CHANNEL, RETURN_AUDIO_CHANNEL,
+};
 use anyhow::{Context, Result};
 use gst::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,8 @@ pub enum ClientMsg {
         #[serde(rename = "sdpMLineIndex")]
         sdp_m_line_index: u32,
     },
+    /// Statistiques locales de la page (encodeur, réseau).
+    Stats(PhoneStats),
     Bye,
 }
 
@@ -273,6 +278,48 @@ impl PhoneSession {
                 .context("thread bus webrtc")?;
         }
 
+        // --- Statistiques RTP (toutes les secondes) -------------------------------------------
+        {
+            let webrtc = webrtc.clone();
+            let engine = engine.clone();
+            let cancel = session.cancel.clone();
+            std::thread::Builder::new()
+                .name("rtc-stats".into())
+                .spawn(move || {
+                    let mut prev: Option<(std::time::Instant, u64)> = None;
+                    while !cancel.is_cancelled() {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let promise = gst::Promise::with_change_func(move |reply| {
+                            let st = match reply {
+                                Ok(Some(s)) => Some(s.to_owned()),
+                                _ => None,
+                            };
+                            let _ = tx.send(st);
+                        });
+                        webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+                        let Ok(Some(reply)) = rx.recv_timeout(std::time::Duration::from_secs(2))
+                        else {
+                            continue;
+                        };
+                        if let Some(mut vs) = parse_video_stats(&reply) {
+                            let now = std::time::Instant::now();
+                            if let Some((t0, b0)) = prev {
+                                let dt = now.duration_since(t0).as_secs_f32().max(0.001);
+                                vs.stats.bitrate_kbps =
+                                    vs.bytes.saturating_sub(b0) as f32 * 8.0 / 1000.0 / dt;
+                            }
+                            prev = Some((now, vs.bytes));
+                            engine.set_rtp_stats(Some(vs.stats));
+                        }
+                    }
+                })
+                .context("thread stats")?;
+        }
+
         pipeline
             .set_state(gst::State::Playing)
             .context("démarrage du pipeline WebRTC")?;
@@ -352,6 +399,10 @@ impl PhoneSession {
         Ok(())
     }
 
+    pub fn set_phone_stats(&self, engine: &Engine, st: PhoneStats) {
+        engine.set_phone_stats(Some(st));
+    }
+
     pub fn add_ice(&self, mline: u32, candidate: &str) {
         self.webrtc
             .emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
@@ -370,4 +421,99 @@ impl Drop for PhoneSession {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Statistiques vidéo extraites de la réponse de `get-stats`.
+struct VideoStats {
+    stats: RtpStats,
+    bytes: u64,
+}
+
+/// Lit une valeur numérique quel que soit son type GLib exact.
+fn num_f64(s: &gst::StructureRef, name: &str) -> Option<f64> {
+    let v = s.value(name).ok()?;
+    if let Ok(x) = v.get::<f64>() {
+        return Some(x);
+    }
+    if let Ok(x) = v.get::<u64>() {
+        return Some(x as f64);
+    }
+    if let Ok(x) = v.get::<i64>() {
+        return Some(x as f64);
+    }
+    if let Ok(x) = v.get::<u32>() {
+        return Some(x as f64);
+    }
+    if let Ok(x) = v.get::<i32>() {
+        return Some(x as f64);
+    }
+    None
+}
+
+fn parse_video_stats(reply: &gst::Structure) -> Option<VideoStats> {
+    let mut codecs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut inbound: Vec<gst::Structure> = Vec::new();
+    let mut rtt_ms = None;
+    for (name, value) in reply.iter() {
+        let Ok(st) = value.get::<gst::Structure>() else {
+            continue;
+        };
+        let ty = st.get::<gst_webrtc::WebRTCStatsType>("type").ok();
+        match ty {
+            Some(gst_webrtc::WebRTCStatsType::Codec) => {
+                if let Ok(mime) = st.get::<String>("mime-type") {
+                    codecs.insert(name.to_string(), mime);
+                }
+            }
+            Some(gst_webrtc::WebRTCStatsType::InboundRtp) => inbound.push(st),
+            Some(gst_webrtc::WebRTCStatsType::CandidatePair) => {
+                if let Some(rtt) = num_f64(&st, "current-round-trip-time") {
+                    if rtt > 0.0 {
+                        rtt_ms = Some((rtt * 1000.0) as f32);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let video = inbound.iter().find(|st| {
+        let mime = st
+            .get::<String>("codec-id")
+            .ok()
+            .and_then(|id| codecs.get(&id).cloned())
+            .unwrap_or_default();
+        mime.starts_with("video/")
+            || st
+                .get::<String>("kind")
+                .map(|k| k == "video")
+                .unwrap_or(false)
+    })?;
+    let codec = video
+        .get::<String>("codec-id")
+        .ok()
+        .and_then(|id| codecs.get(&id).cloned())
+        .unwrap_or_default()
+        .trim_start_matches("video/")
+        .to_string();
+    let received = num_f64(video, "packets-received").unwrap_or(0.0);
+    let lost = num_f64(video, "packets-lost").unwrap_or(0.0);
+    let loss_percent = if received + lost > 0.0 {
+        (lost / (received + lost) * 100.0) as f32
+    } else {
+        0.0
+    };
+    Some(VideoStats {
+        stats: RtpStats {
+            codec,
+            bitrate_kbps: 0.0,
+            packets_received: received as u64,
+            packets_lost: lost as i64,
+            loss_percent,
+            jitter_ms: (num_f64(video, "jitter").unwrap_or(0.0) * 1000.0) as f32,
+            nack_count: num_f64(video, "nack-count").unwrap_or(0.0) as u32,
+            pli_count: num_f64(video, "pli-count").unwrap_or(0.0) as u32,
+            rtt_ms,
+        },
+        bytes: num_f64(video, "bytes-received").unwrap_or(0.0) as u64,
+    })
 }

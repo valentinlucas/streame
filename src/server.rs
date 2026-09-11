@@ -150,6 +150,11 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
                             s.add_ice(sdp_m_line_index, &candidate);
                         }
                     }
+                    ClientMsg::Stats(st) => {
+                        if let Some(s) = &session {
+                            s.set_phone_stats(&state.engine, st);
+                        }
+                    }
                     ClientMsg::Bye => break,
                 }
             }

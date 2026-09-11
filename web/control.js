@@ -16,7 +16,12 @@
     p.textContent = 'Téléphone : ' + (state.phone_connected ? (state.phone_name || 'connecté') : 'absent');
     p.className = 'pill ' + (state.phone_connected ? 'on' : 'off');
     const st = state.stats || {};
-    $('stats').textContent = (st.phone_width ? `${st.phone_width}x${st.phone_height} · ${Math.round(st.phone_fps)} i/s · ` : '') + `rendu ${Math.round(st.render_fps)} i/s`;
+    const parts = [];
+    if (st.phone_width) parts.push(`reçu ${st.phone_width}x${st.phone_height} ${Math.round(st.phone_fps)} i/s`);
+    if (st.rtp) parts.push(`${st.rtp.codec} ${(st.rtp.bitrate_kbps / 1000).toFixed(1)} Mb/s · perte ${st.rtp.loss_percent.toFixed(1)}% · gigue ${Math.round(st.rtp.jitter_ms)} ms · NACK ${st.rtp.nack_count} PLI ${st.rtp.pli_count}` + (st.rtp.rtt_ms != null ? ` · RTT ${Math.round(st.rtp.rtt_ms)} ms` : ''));
+    if (st.phone) parts.push(`envoi ${st.phone.width}x${st.phone.height} ${Math.round(st.phone.fps)} i/s ${(st.phone.bitrate_kbps / 1000).toFixed(1)} Mb/s · limite : ${st.phone.quality_limitation}`);
+    parts.push(`rendu ${Math.round(st.render_fps)} i/s`);
+    $('stats').textContent = parts.join(' · ');
     const box = $('scenes');
     box.innerHTML = '';
     state.scenes.forEach((s, i) => {

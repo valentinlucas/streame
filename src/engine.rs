@@ -53,12 +53,41 @@ pub struct SceneInfo {
     pub name: String,
 }
 
+/// Statistiques RTP côté Mac (webrtcbin `get-stats`, flux vidéo entrant).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RtpStats {
+    pub codec: String,
+    pub bitrate_kbps: f32,
+    pub packets_received: u64,
+    pub packets_lost: i64,
+    pub loss_percent: f32,
+    pub jitter_ms: f32,
+    pub nack_count: u32,
+    pub pli_count: u32,
+    pub rtt_ms: Option<f32>,
+}
+
+/// Statistiques envoyées par la page du téléphone (encodeur et réseau vus de son côté).
+#[derive(Debug, Clone, Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct PhoneStats {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    pub bitrate_kbps: f32,
+    pub quality_limitation: String,
+    pub rtt_ms: Option<f32>,
+    pub codec: String,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Stats {
     pub phone_fps: f32,
     pub phone_width: u32,
     pub phone_height: u32,
     pub render_fps: f32,
+    pub rtp: Option<RtpStats>,
+    pub phone: Option<PhoneStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +166,8 @@ pub struct Engine {
     state: Mutex<State>,
     events: broadcast::Sender<Event>,
     pub render_fps: FpsCounter,
+    rtp_stats: Mutex<Option<RtpStats>>,
+    phone_stats: Mutex<Option<PhoneStats>>,
 }
 
 fn make(factory: &str) -> Result<gst::Element> {
@@ -244,6 +275,8 @@ impl Engine {
             }),
             events,
             render_fps: FpsCounter::new(),
+            rtp_stats: Mutex::new(None),
+            phone_stats: Mutex::new(None),
         });
         engine.spawn_bus_thread();
         Ok(engine)
@@ -611,7 +644,17 @@ impl Engine {
             phone_width: w,
             phone_height: h,
             render_fps: self.render_fps.value(),
+            rtp: self.rtp_stats.lock().unwrap().clone(),
+            phone: self.phone_stats.lock().unwrap().clone(),
         }
+    }
+
+    pub fn set_rtp_stats(&self, st: Option<RtpStats>) {
+        *self.rtp_stats.lock().unwrap() = st;
+    }
+
+    pub fn set_phone_stats(&self, st: Option<PhoneStats>) {
+        *self.phone_stats.lock().unwrap() = st;
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -723,6 +766,8 @@ impl Engine {
         }
         if name.is_none() {
             self.phone.clear();
+            self.set_rtp_stats(None);
+            self.set_phone_stats(None);
         }
         let _ = self.events.send(Event::Phone {
             connected: name.is_some(),

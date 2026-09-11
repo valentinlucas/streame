@@ -3,7 +3,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const status = (t) => { $('status').textContent = t; console.log('[streame]', t); };
-  let ws, pc, stream, wakeLock, wantConnected = false, retryTimer;
+  let ws, pc, stream, wakeLock, wantConnected = false, retryTimer, statsTimer, prevStats = null;
 
   function constraints() {
     const q = parseInt($('quality').value, 10);
@@ -69,6 +69,8 @@
     pc.onconnectionstatechange = () => {
       status('WebRTC : ' + pc.connectionState);
       if (pc.connectionState === 'failed') { ws.close(); }
+      clearInterval(statsTimer);
+      if (pc.connectionState === 'connected') statsTimer = setInterval(() => reportStats().catch(() => {}), 1000);
     };
     await pc.setRemoteDescription({ type: 'offer', sdp });
     // Le Mac propose : audio (bidirectionnel) + vidéo (réception seule chez lui).
@@ -98,8 +100,35 @@
     }
   }
 
+  // Statistiques de l'encodeur et du réseau, affichées ici et envoyées au Mac.
+  async function reportStats() {
+    if (!pc || pc.connectionState !== 'connected') return;
+    let out = null, rtt = null, codecs = {};
+    const report = await pc.getStats();
+    report.forEach((s) => { if (s.type === 'codec') codecs[s.id] = s.mimeType; });
+    report.forEach((s) => {
+      if (s.type === 'outbound-rtp' && s.kind === 'video') out = s;
+      if (s.type === 'candidate-pair' && s.state === 'succeeded' && s.currentRoundTripTime != null) rtt = s.currentRoundTripTime * 1000;
+    });
+    if (!out) return;
+    const now = performance.now();
+    let kbps = 0;
+    if (prevStats && out.bytesSent != null) kbps = (out.bytesSent - prevStats.bytes) * 8 / ((now - prevStats.at) / 1000) / 1000;
+    prevStats = { bytes: out.bytesSent || 0, at: now };
+    const st = {
+      type: 'stats',
+      width: out.frameWidth || 0, height: out.frameHeight || 0,
+      fps: out.framesPerSecond || 0, bitrate_kbps: kbps,
+      quality_limitation: out.qualityLimitationReason || 'inconnue',
+      rtt_ms: rtt, codec: (codecs[out.codecId] || '').replace('video/', ''),
+    };
+    send(st);
+    status(`Connecté · ${st.width}x${st.height} · ${Math.round(st.fps)} i/s · ${(kbps / 1000).toFixed(1)} Mb/s · limite : ${st.quality_limitation}` + (rtt != null ? ` · RTT ${Math.round(rtt)} ms` : ''));
+  }
+
   function stop(userInitiated) {
     wantConnected = false;
+    clearInterval(statsTimer); prevStats = null;
     clearTimeout(retryTimer);
     if (ws) { try { send({ type: 'bye' }); ws.close(); } catch (e) { /* ignoré */ } ws = null; }
     if (pc) { pc.close(); pc = null; }
