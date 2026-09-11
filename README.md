@@ -177,6 +177,10 @@ disponibles dans `GET /api/state`.
 - Pas de son des vidéos d'overlay (volontairement muet), pas d'enregistrement ni de streaming RTMP.
 - Le retour audio vers le téléphone est stéréo 48 kHz Opus ; l'annulation d'écho est faite côté téléphone.
 - Sur Chrome/Android, forcer `video_codec = "VP8"` si le H264 matériel n'est pas disponible.
+- La négociation active l'extension d'en-tête RTP *transport-wide-cc* : sans elle, l'estimation
+  de bande passante du téléphone reste bloquée au débit plancher (~300 kb/s) et l'image est très
+  dégradée malgré un réseau rapide. Le débit maximal est fixé côté téléphone (`web/app.js`) selon
+  la résolution (8 Mb/s en 1080p).
 
 ## Tests
 

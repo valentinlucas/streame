@@ -58,6 +58,9 @@ pub enum ServerMsg {
     },
 }
 
+/// Extension d'en-tête RTP « transport-wide congestion control ».
+const TWCC_URI: &str = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+
 pub struct PhoneSession {
     pub name: String,
     pipeline: gst::Pipeline,
@@ -135,7 +138,12 @@ impl PhoneSession {
             .field("clock-rate", 90000i32)
             .field("rtcp-fb-nack-pli", true)
             .field("rtcp-fb-ccm-fir", true)
-            .field("rtcp-fb-transport-cc", true);
+            .field("rtcp-fb-transport-cc", true)
+            // Extension d'en-tête « transport-wide-cc » : sans elle, le téléphone ne reçoit
+            // aucun retour de bande passante et son encodeur reste bloqué au débit plancher
+            // (~300 kb/s), d'où une image très dégradée en 1080p. webrtcbin ne l'ajoute pas
+            // tout seul, il faut la déclarer dans les caps de la transceiver.
+            .field("extmap-1", TWCC_URI);
         vb = if codec == "VP8" {
             vb.field("encoding-name", "VP8").field("payload", 97i32)
         } else {
@@ -195,7 +203,7 @@ impl PhoneSession {
                     );
                     match offer.sdp().as_text() {
                         Ok(sdp) => {
-                            debug!("offre SDP envoyée");
+                            debug!("offre SDP envoyée :\n{sdp}");
                             let _ = out.send(ServerMsg::Offer { sdp });
                         }
                         Err(e) => error!("sdp → texte : {e}"),
@@ -305,6 +313,7 @@ impl PhoneSession {
                         else {
                             continue;
                         };
+                        tracing::trace!("stats brutes :\n{reply:#?}");
                         if let Some(mut vs) = parse_video_stats(&reply) {
                             let now = std::time::Instant::now();
                             if let Some((t0, b0)) = prev {
