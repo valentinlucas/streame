@@ -27,6 +27,7 @@
     status('Accès à la caméra…');
     try {
       stream = await navigator.mediaDevices.getUserMedia(constraints());
+      stream.getVideoTracks().forEach((t) => { try { t.contentHint = 'motion'; } catch (e) { /* ignoré */ } });
     } catch (e) {
       status('Caméra refusée : ' + e.message + ' (HTTPS requis)');
       $('connect').disabled = false; wantConnected = false;
@@ -88,7 +89,9 @@
       try {
         const p = s.getParameters();
         if (p.encodings && p.encodings.length) {
-          p.encodings[0].maxBitrate = 4_000_000;
+          const q = parseInt($('quality').value, 10);
+          p.encodings[0].maxBitrate = { 1080: 8_000_000, 720: 4_500_000, 480: 2_000_000 }[q] || 4_000_000;
+          p.degradationPreference = 'maintain-resolution';
           await s.setParameters(p);
         }
       } catch (e) { console.warn('setParameters', e); }

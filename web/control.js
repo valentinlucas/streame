@@ -15,6 +15,8 @@
     const p = $('phone');
     p.textContent = 'Téléphone : ' + (state.phone_connected ? (state.phone_name || 'connecté') : 'absent');
     p.className = 'pill ' + (state.phone_connected ? 'on' : 'off');
+    const st = state.stats || {};
+    $('stats').textContent = (st.phone_width ? `${st.phone_width}x${st.phone_height} · ${Math.round(st.phone_fps)} i/s · ` : '') + `rendu ${Math.round(st.render_fps)} i/s`;
     const box = $('scenes');
     box.innerHTML = '';
     state.scenes.forEach((s, i) => {

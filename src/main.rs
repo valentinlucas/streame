@@ -8,9 +8,12 @@
 mod audio;
 mod config;
 mod engine;
+mod frame;
 mod layout;
+mod render;
 mod server;
 mod streamdeck;
+mod text;
 mod tls;
 mod ui;
 mod webrtc;
@@ -33,13 +36,9 @@ struct Cli {
     #[arg(short, long, default_value = "streame.toml")]
     config: PathBuf,
 
-    /// Pas de fenêtres natives (sortie via autovideosink) — utile pour les tests.
+    /// Pas de fenêtres (serveur, audio et API seulement) — tests sans écran.
     #[arg(long)]
     no_window: bool,
-
-    /// Aucune sortie vidéo (tests sans écran).
-    #[arg(long, hide = true)]
-    fake_output: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -95,25 +94,8 @@ fn main() -> Result<()> {
     let ips: Vec<String> = local_ips();
     let tls_files = tls::load_or_create(&cfg.resolve(&cfg.server.cert_dir), &ips)?;
 
-    // Moteur + fenêtres.
-    let (engine, event_loop, frames) = if cli.no_window || cli.fake_output {
-        (
-            engine::Engine::new(cfg.clone(), None, cli.fake_output)?,
-            None,
-            None,
-        )
-    } else {
-        let event_loop =
-            ui::App::build_event_loop().context("boucle d'événements (écran requis)")?;
-        let frames = ui::FrameStore::new(event_loop.create_proxy());
-        let f = frames.clone();
-        let cb: engine::FrameCallback = Arc::new(move |t, s| f.push(t, s));
-        (
-            engine::Engine::new(cfg.clone(), Some(cb), false)?,
-            Some(event_loop),
-            Some(frames),
-        )
-    };
+    // Moteur.
+    let engine = engine::Engine::new(cfg.clone())?;
 
     // Serveur HTTPS + signaling dans un runtime tokio sur un thread dédié.
     let state = Arc::new(server::AppState {
@@ -139,18 +121,12 @@ fn main() -> Result<()> {
     engine.start()?;
     print_urls(&cfg, &ips);
 
-    match (event_loop, frames) {
-        (Some(event_loop), Some(frames)) => {
-            let mut app = ui::App::new(cfg.clone(), engine.clone(), frames);
-            event_loop
-                .run_app(&mut app)
-                .context("boucle d'événements")?;
-            info!("fermeture");
-        }
-        _ => {
-            info!("mode sans fenêtre : Ctrl-C pour quitter");
-            let _ = server_thread.join();
-        }
+    if cli.no_window {
+        info!("mode sans fenêtre : Ctrl-C pour quitter");
+        let _ = server_thread.join();
+    } else {
+        ui::run(cfg.clone(), engine.clone())?;
+        info!("fermeture");
     }
     if let Some(p) = state.phone.lock().unwrap().take() {
         p.close();

@@ -1,57 +1,25 @@
-//! Fenêtres natives (winit + softbuffer) : sortie programme (HDMI) et multiview.
+//! Fenêtres natives (winit) : sortie programme (HDMI) et multiview, rendues par wgpu.
 
 use crate::config::Config;
-use crate::engine::{Engine, Target};
-use anyhow::Result;
-use gst_video::prelude::*;
-use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use crate::engine::Engine;
+use crate::layout;
+use crate::render::{Renderer, SurfaceState};
+use anyhow::{Context, Result};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowId};
 
-#[derive(Debug)]
-pub enum UserEvent {
-    Frame(Target),
-}
-
-/// Dernière image reçue pour chaque cible ; le moteur y écrit, la fenêtre y lit.
-pub struct FrameStore {
-    program: Mutex<Option<gst::Sample>>,
-    multiview: Mutex<Option<gst::Sample>>,
-    proxy: Mutex<EventLoopProxy<UserEvent>>,
-}
-
-impl FrameStore {
-    pub fn new(proxy: EventLoopProxy<UserEvent>) -> Arc<Self> {
-        Arc::new(Self {
-            program: Mutex::new(None),
-            multiview: Mutex::new(None),
-            proxy: Mutex::new(proxy),
-        })
-    }
-
-    fn slot(&self, t: Target) -> &Mutex<Option<gst::Sample>> {
-        match t {
-            Target::Program => &self.program,
-            Target::Multiview => &self.multiview,
-        }
-    }
-
-    pub fn push(&self, t: Target, sample: gst::Sample) {
-        *self.slot(t).lock().unwrap() = Some(sample);
-        let _ = self.proxy.lock().unwrap().send_event(UserEvent::Frame(t));
-    }
-
-    fn take(&self, t: Target) -> Option<gst::Sample> {
-        self.slot(t).lock().unwrap().clone()
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Program,
+    Multiview,
 }
 
 /// Nom lisible d'un écran. Sur macOS, winit ne donne qu'un numéro de modèle : on lit
@@ -76,35 +44,42 @@ pub fn monitor_name(m: &MonitorHandle) -> String {
 struct WindowState {
     target: Target,
     window: Arc<Window>,
-    _context: softbuffer::Context<Arc<Window>>,
-    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
-    size: (u32, u32),
+    surface: SurfaceState,
     monitor: Option<MonitorHandle>,
 }
 
 pub struct App {
     cfg: Arc<Config>,
     engine: Arc<Engine>,
-    frames: Arc<FrameStore>,
+    renderer: Option<Renderer>,
     windows: Vec<WindowState>,
     cursor: PhysicalPosition<f64>,
     last_click: Option<(usize, Instant)>,
+    stats_text: String,
+    stats_at: Instant,
+    /// Cadence du rendu (période de l'écran programme) et prochaine échéance.
+    frame_period: Duration,
+    next_frame: Instant,
 }
 
 impl App {
-    pub fn new(cfg: Arc<Config>, engine: Arc<Engine>, frames: Arc<FrameStore>) -> Self {
+    pub fn new(cfg: Arc<Config>, engine: Arc<Engine>) -> Self {
         Self {
             cfg,
             engine,
-            frames,
+            renderer: None,
             windows: Vec::new(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             last_click: None,
+            stats_text: String::new(),
+            stats_at: Instant::now() - Duration::from_secs(5),
+            frame_period: Duration::from_micros(16_667),
+            next_frame: Instant::now(),
         }
     }
 
-    pub fn build_event_loop() -> Result<EventLoop<UserEvent>> {
-        Ok(EventLoop::<UserEvent>::with_user_event().build()?)
+    pub fn build_event_loop() -> Result<EventLoop<()>> {
+        Ok(EventLoop::new()?)
     }
 
     fn pick_monitor(
@@ -184,10 +159,15 @@ impl App {
             }
         }
         let window = Arc::new(event_loop.create_window(attrs)?);
-        let context = softbuffer::Context::new(window.clone())
-            .map_err(|e| anyhow::anyhow!("softbuffer : {e}"))?;
-        let surface = softbuffer::Surface::new(&context, window.clone())
-            .map_err(|e| anyhow::anyhow!("softbuffer : {e}"))?;
+        let canvas = (self.cfg.video.width as u32, self.cfg.video.height as u32);
+        let surface = match &mut self.renderer {
+            None => {
+                let (r, s) = Renderer::new(window.clone(), canvas)?;
+                self.renderer = Some(r);
+                s
+            }
+            Some(r) => r.create_surface(window.clone(), false)?,
+        };
         let inner = window.inner_size();
         info!(
             "fenêtre {title} sur « {} » ({}x{})",
@@ -198,128 +178,63 @@ impl App {
             inner.width,
             inner.height
         );
-        let mut ws = WindowState {
+        if target == Target::Program {
+            if let Some(mhz) = monitor.as_ref().and_then(|m| m.refresh_rate_millihertz()) {
+                if mhz > 0 {
+                    self.frame_period = Duration::from_secs_f64(1000.0 / mhz as f64);
+                    info!("cadence de rendu : {:.1} Hz", mhz as f64 / 1000.0);
+                }
+            }
+        }
+        self.windows.push(WindowState {
             target,
             window,
-            _context: context,
             surface,
-            size: (0, 0),
             monitor,
-        };
-        self.resize(&mut ws, inner);
-        self.windows.push(ws);
+        });
         Ok(())
     }
 
-    fn resize(&self, ws: &mut WindowState, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 || ws.size == (size.width, size.height) {
-            return;
-        }
-        ws.size = (size.width, size.height);
-        if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
-            let _ = ws.surface.resize(w, h);
-        }
-        self.engine
-            .set_output_size(ws.target, size.width, size.height);
-    }
-
     fn redraw(&mut self, idx: usize) {
-        let target = self.windows[idx].target;
-        let Some(sample) = self.frames.take(target) else {
-            return;
-        };
-        let Some(buffer) = sample.buffer() else {
-            return;
-        };
-        let Some(caps) = sample.caps() else { return };
-        let Ok(info) = gst_video::VideoInfo::from_caps(caps) else {
-            return;
-        };
-        let Ok(frame) = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info) else {
-            return;
-        };
-        let fw = frame.width() as usize;
-        let fh = frame.height() as usize;
-        let stride = frame.plane_stride()[0] as usize;
-        let Ok(data) = frame.plane_data(0) else {
-            return;
-        };
-
-        let (program, preview) = (self.engine.program_index(), self.engine.preview_index());
-        let layout = self.engine.layout().clone();
-        let ws = &mut self.windows[idx];
-        let (ww, wh) = (ws.size.0 as usize, ws.size.1 as usize);
-        if ww == 0 || wh == 0 {
-            return;
+        if self.stats_at.elapsed() >= Duration::from_secs(1) {
+            let st = self.engine.stats();
+            self.stats_text = if st.phone_width > 0 {
+                format!(
+                    "Tél. {}x{} {:.0} i/s · rendu {:.0} i/s",
+                    st.phone_width, st.phone_height, st.phone_fps, st.render_fps
+                )
+            } else {
+                format!("rendu {:.0} i/s", st.render_fps)
+            };
+            self.stats_at = Instant::now();
         }
-        let Ok(mut out) = ws.surface.buffer_mut() else {
+        let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        if out.len() != ww * wh {
-            return;
+        let ws = &self.windows[idx];
+        let res = match ws.target {
+            Target::Program => renderer.render_program(&ws.surface, &self.engine),
+            Target::Multiview => renderer
+                .render_multiview(&ws.surface, &self.engine, &self.stats_text)
+                .map(|_| true),
+        };
+        match res {
+            Ok(true) if ws.target == Target::Program => self.engine.render_fps.tick(),
+            Ok(_) => {}
+            Err(e) => error!("rendu {:?} : {e:#}", ws.target),
         }
-        if fw == ww && fh == wh {
-            for y in 0..fh {
-                let row = &data[y * stride..y * stride + fw * 4];
-                let dst = &mut out[y * ww..(y + 1) * ww];
-                for (d, px) in dst.iter_mut().zip(row.chunks_exact(4)) {
-                    *d = u32::from_le_bytes([px[0], px[1], px[2], 0]);
-                }
-            }
-        } else {
-            // Taille transitoire (redimensionnement) : mise à l'échelle au plus proche voisin.
-            for y in 0..wh {
-                let sy = y * fh / wh;
-                let row = &data[sy * stride..];
-                let dst = &mut out[y * ww..(y + 1) * ww];
-                for (x, d) in dst.iter_mut().enumerate() {
-                    let sx = (x * fw / ww) * 4;
-                    *d = u32::from_le_bytes([row[sx], row[sx + 1], row[sx + 2], 0]);
-                }
-            }
-        }
-
-        if target == Target::Multiview {
-            let to = (ww as i32, wh as i32);
-            let thickness = (ww / 320).max(2) as i32;
-            for (i, r) in layout.tiles.iter().enumerate() {
-                let color = if i == program {
-                    Some(0x00E0_2020)
-                } else if i == preview {
-                    Some(0x0020_C040)
-                } else {
-                    None
-                };
-                if let Some(c) = color {
-                    draw_rect(&mut out, ww, wh, r.scaled(layout.canvas, to), thickness, c);
-                }
-            }
-            draw_rect(
-                &mut out,
-                ww,
-                wh,
-                layout.program.scaled(layout.canvas, to),
-                thickness,
-                0x00E0_2020,
-            );
-            draw_rect(
-                &mut out,
-                ww,
-                wh,
-                layout.preview.scaled(layout.canvas, to),
-                thickness,
-                0x0020_C040,
-            );
-        }
-        let _ = out.present();
     }
 
     fn multiview_click(&mut self, idx: usize) {
         let ws = &self.windows[idx];
-        let layout = self.engine.layout();
-        let x = (self.cursor.x * layout.canvas.0 as f64 / ws.size.0.max(1) as f64) as i32;
-        let y = (self.cursor.y * layout.canvas.1 as f64 / ws.size.1.max(1) as f64) as i32;
-        let Some(tile) = layout.tile_at(x, y) else {
+        let (w, h) = ws.surface.size();
+        let lay = layout::compute(
+            w as i32,
+            h as i32,
+            self.engine.scenes_ref().len(),
+            self.cfg.multiview.columns,
+        );
+        let Some(tile) = lay.tile_at(self.cursor.x as i32, self.cursor.y as i32) else {
             return;
         };
         let now = Instant::now();
@@ -354,25 +269,6 @@ impl App {
             Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => self.engine.take(),
             Key::Named(NamedKey::Escape) => self.windows[idx].window.set_fullscreen(None),
             _ => {}
-        }
-    }
-}
-
-fn draw_rect(buf: &mut [u32], w: usize, h: usize, r: crate::layout::Rect, t: i32, color: u32) {
-    let x0 = r.x.max(0) as usize;
-    let y0 = r.y.max(0) as usize;
-    let x1 = ((r.x + r.w) as usize).min(w);
-    let y1 = ((r.y + r.h) as usize).min(h);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let t = t as usize;
-    for y in y0..y1 {
-        let edge_y = y < y0 + t || y + t >= y1;
-        for x in x0..x1 {
-            if edge_y || x < x0 + t || x + t >= x1 {
-                buf[y * w + x] = color;
-            }
         }
     }
 }
@@ -417,32 +313,40 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
     Ok(lister.0)
 }
 
-impl ApplicationHandler<UserEvent> for App {
+impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if !self.windows.is_empty() {
             return;
         }
         if let Err(e) = self.create_window(event_loop, Target::Program) {
-            warn!("fenêtre programme : {e:#}");
+            error!("fenêtre programme : {e:#}");
         }
         if self.cfg.multiview.enabled {
             if let Err(e) = self.create_window(event_loop, Target::Multiview) {
-                warn!("fenêtre multiview : {e:#}");
+                error!("fenêtre multiview : {e:#}");
             }
         }
         if self.windows.is_empty() {
             event_loop.exit();
+            return;
         }
+        self.next_frame = Instant::now();
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-        match event {
-            UserEvent::Frame(t) => {
-                if let Some(ws) = self.windows.iter().find(|w| w.target == t) {
-                    ws.window.request_redraw();
-                }
+    /// Cadence le rendu : une image par période d'écran, pour toutes les fenêtres.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now >= self.next_frame {
+            for w in &self.windows {
+                w.window.request_redraw();
             }
+            self.next_frame = if now - self.next_frame > self.frame_period {
+                now + self.frame_period
+            } else {
+                self.next_frame + self.frame_period
+            };
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -458,9 +362,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Resized(size) => {
-                let mut ws = self.windows.remove(idx);
-                self.resize(&mut ws, size);
-                self.windows.insert(idx, ws);
+                if let Some(r) = self.renderer.as_mut() {
+                    r.resize(&mut self.windows[idx].surface, size.width, size.height);
+                }
             }
             WindowEvent::RedrawRequested => self.redraw(idx),
             WindowEvent::CursorMoved { position, .. } => self.cursor = position,
@@ -479,4 +383,14 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+/// Lance les fenêtres et la boucle d'événements (bloquant, thread principal).
+pub fn run(cfg: Arc<Config>, engine: Arc<Engine>) -> Result<()> {
+    let event_loop = App::build_event_loop().context("boucle d'événements (écran requis)")?;
+    let mut app = App::new(cfg, engine);
+    event_loop
+        .run_app(&mut app)
+        .context("boucle d'événements")?;
+    Ok(())
 }

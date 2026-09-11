@@ -2,15 +2,13 @@
 
 use crate::config::{parse_color, ButtonConfig, Config};
 use crate::engine::Engine;
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use crate::text;
 use elgato_streamdeck::{list_devices, new_hidapi, StreamDeck, StreamDeckInput};
-use image::{DynamicImage, Rgb, RgbImage};
+use image::{DynamicImage, Rgba, RgbaImage};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tracing::{error, info, warn};
-
-const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 enum Action {
@@ -102,13 +100,6 @@ pub fn spawn(cfg: Arc<Config>, engine: Arc<Engine>) -> Option<JoinHandle<()>> {
     if !cfg.streamdeck.enabled {
         return None;
     }
-    let font = match FontRef::try_from_slice(FONT_BYTES) {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Stream Deck : police illisible : {e}");
-            return None;
-        }
-    };
     let handle = thread::Builder::new()
         .name("streamdeck".into())
         .spawn(move || {
@@ -118,7 +109,7 @@ pub fn spawn(cfg: Arc<Config>, engine: Arc<Engine>) -> Option<JoinHandle<()>> {
                 match connect(&cfg) {
                     Some(deck) => {
                         warned = false;
-                        run_deck(&deck, &cfg, &engine, &buttons, &font);
+                        run_deck(&deck, &cfg, &engine, &buttons);
                         warn!("Stream Deck déconnecté, nouvelle tentative dans 3 s");
                     }
                     None => {
@@ -158,13 +149,7 @@ fn connect(cfg: &Config) -> Option<StreamDeck> {
     }
 }
 
-fn run_deck(
-    deck: &StreamDeck,
-    cfg: &Config,
-    engine: &Arc<Engine>,
-    buttons: &[Button],
-    font: &FontRef<'static>,
-) {
+fn run_deck(deck: &StreamDeck, cfg: &Config, engine: &Arc<Engine>, buttons: &[Button]) {
     let key_count = deck.kind().key_count() as usize;
     let _ = deck.reset();
     let _ = deck.set_brightness(cfg.streamdeck.brightness.min(100));
@@ -174,7 +159,7 @@ fn run_deck(
         let cur = (engine.program_index(), engine.preview_index());
         if cur != last {
             last = cur;
-            if let Err(e) = render_all(deck, buttons, cur, font) {
+            if let Err(e) = render_all(deck, buttons, cur) {
                 warn!("Stream Deck : rendu : {e}");
                 return;
             }
@@ -208,7 +193,6 @@ fn render_all(
     deck: &StreamDeck,
     buttons: &[Button],
     (program, preview): (usize, usize),
-    font: &FontRef<'static>,
 ) -> Result<(), elgato_streamdeck::StreamDeckError> {
     let format = deck.kind().key_image_format();
     let (w, h) = format.size;
@@ -228,95 +212,19 @@ fn render_all(
                     }
                     _ => (b.color, (230, 230, 230)),
                 };
-                render_button(w as u32, h as u32, &b.label, bg, fg, font)
+                let lines = text::wrap_label(&b.label);
+                text::render_centered(
+                    &lines,
+                    w as u32,
+                    h as u32,
+                    (h as f32 / 3.2).max(10.0),
+                    [fg.0, fg.1, fg.2, 255],
+                    [bg.0, bg.1, bg.2, 255],
+                )
             }
-            None => RgbImage::from_pixel(w as u32, h as u32, Rgb([0, 0, 0])),
+            None => RgbaImage::from_pixel(w as u32, h as u32, Rgba([0, 0, 0, 255])),
         };
-        deck.set_button_image(key, DynamicImage::ImageRgb8(img))?;
+        deck.set_button_image(key, DynamicImage::ImageRgba8(img))?;
     }
     deck.flush()
-}
-
-/// Dessine un bouton : fond coloré + texte centré (2 lignes max).
-fn render_button(
-    w: u32,
-    h: u32,
-    label: &str,
-    bg: (u8, u8, u8),
-    fg: (u8, u8, u8),
-    font: &FontRef<'static>,
-) -> RgbImage {
-    let mut img = RgbImage::from_pixel(w, h, Rgb([bg.0, bg.1, bg.2]));
-    let lines = wrap_label(label);
-    let mut px = (h as f32 / 3.2).max(10.0);
-    let margin = w as f32 * 0.9;
-    // Réduit la taille jusqu'à ce que toutes les lignes tiennent.
-    loop {
-        let scaled = font.as_scaled(PxScale::from(px));
-        let widest = lines
-            .iter()
-            .map(|l| text_width(&scaled, l))
-            .fold(0.0, f32::max);
-        if widest <= margin || px <= 8.0 {
-            break;
-        }
-        px -= 1.0;
-    }
-    let scaled = font.as_scaled(PxScale::from(px));
-    let line_h = scaled.height() + scaled.line_gap();
-    let total_h = line_h * lines.len() as f32;
-    let mut y = (h as f32 - total_h) / 2.0 + scaled.ascent();
-    for line in &lines {
-        let tw = text_width(&scaled, line);
-        let mut x = (w as f32 - tw) / 2.0;
-        let mut prev: Option<ab_glyph::GlyphId> = None;
-        for ch in line.chars() {
-            let id = font.glyph_id(ch);
-            if let Some(p) = prev {
-                x += scaled.kern(p, id);
-            }
-            let glyph = id.with_scale_and_position(PxScale::from(px), ab_glyph::point(x, y));
-            if let Some(outlined) = font.outline_glyph(glyph) {
-                let bounds = outlined.px_bounds();
-                outlined.draw(|gx, gy, c| {
-                    let ix = bounds.min.x as i32 + gx as i32;
-                    let iy = bounds.min.y as i32 + gy as i32;
-                    if ix >= 0 && iy >= 0 && (ix as u32) < w && (iy as u32) < h {
-                        let p = img.get_pixel_mut(ix as u32, iy as u32);
-                        for k in 0..3 {
-                            let f = [fg.0, fg.1, fg.2][k] as f32;
-                            p.0[k] = (p.0[k] as f32 * (1.0 - c) + f * c) as u8;
-                        }
-                    }
-                });
-            }
-            x += scaled.h_advance(id);
-            prev = Some(id);
-        }
-        y += line_h;
-    }
-    img
-}
-
-fn text_width<F: Font>(scaled: &ab_glyph::PxScaleFont<F>, text: &str) -> f32 {
-    text.chars()
-        .map(|c| scaled.h_advance(scaled.glyph_id(c)))
-        .sum()
-}
-
-fn wrap_label(label: &str) -> Vec<String> {
-    let words: Vec<&str> = label.split_whitespace().collect();
-    if words.len() <= 1 || label.len() <= 8 {
-        return vec![label.to_string()];
-    }
-    let mut best = (usize::MAX, 0);
-    for split in 1..words.len() {
-        let a = words[..split].join(" ");
-        let b = words[split..].join(" ");
-        let diff = a.len().abs_diff(b.len());
-        if diff < best.0 {
-            best = (diff, split);
-        }
-    }
-    vec![words[..best.1].join(" "), words[best.1..].join(" ")]
 }

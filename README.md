@@ -1,17 +1,17 @@
 # Streame
 
 Régie vidéo légère en Rust pour Mac : un téléphone envoie sa caméra et son micro en WebRTC,
-le Mac compose des scènes façon OBS, affiche le programme sur la sortie HDMI, route l'audio
-vers une carte son multicanal (Behringer Wing) et renvoie un retour audio au téléphone.
-Pilotage par Stream Deck, multiview cliquable, page web de contrôle et API HTTP.
+le Mac compose des scènes façon OBS sur le GPU (Metal), affiche le programme sur la sortie HDMI,
+route l'audio vers une carte son multicanal (Behringer Wing) et renvoie un retour audio au
+téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôle et API HTTP.
 
 ```text
  Téléphone (Safari/Chrome)                     Mac (streame)
  ┌───────────────────────┐   HTTPS + WS      ┌──────────────────────────────────────────────┐
  │ page web /            │◄──────────────────│ serveur axum : page, signaling, /control, API │
- │ caméra + micro        │ ── WebRTC vidéo ─►│ webrtcbin ─► décodage ─► intervideosink        │
+ │ caméra + micro        │ ── WebRTC vidéo ─►│ webrtcbin ─► vtdec (NV12) ─► texture GPU       │
  │ retour audio ◄────────│ ◄─ WebRTC audio ─ │                       ▼                       │
- └───────────────────────┘                   │  scènes (compositor) ─► programme ─► HDMI      │
+ └───────────────────────┘                   │  scènes (wgpu/Metal) ─► programme ─► HDMI      │
                                              │        └─► multiview (fenêtre cliquable)        │
    Stream Deck ─────────────────────────────►│  audio : téléphone ─► Wing (canaux au choix)    │
                                              │          Wing (entrées au choix) ─► téléphone   │
@@ -24,7 +24,9 @@ Pilotage par Stream Deck, multiview cliquable, page web de contrôle et API HTTP
   Vidéo H264 (ou VP8) + audio Opus en WebRTC, signaling par WebSocket, un seul téléphone à la fois
   (une nouvelle connexion remplace la précédente).
 - **Retour audio** : les entrées choisies de la carte son sont renvoyées au téléphone (bidirectionnel).
-- **Sortie HDMI** : fenêtre plein écran sur l'écran de votre choix, résolution/fréquence configurables.
+- **Composition GPU** : scènes, fondus et multiview rendus par wgpu (Metal sur macOS), à la
+  fréquence de l'écran ; le décodage matériel (VideoToolbox) sort en NV12, converti dans le shader.
+- **Sortie HDMI** : fenêtre plein écran sur l'écran de votre choix (nom ou index).
 - **Scènes** : calques `phone` (flux du téléphone), `color`, `image` (PNG avec transparence),
   `video` (fichier, en boucle, avec opacité) et `text`. Exemples fournis : noir, direct, habillage
   d'antenne, overlay vidéo.
@@ -86,12 +88,12 @@ Voir `streame.example.toml` pour un exemple complet. Principales sections :
 [server]
 bind = "0.0.0.0:8443"
 video_codec = "H264"          # ou "VP8"
+h264_profile_level_id = "42e01f"   # "640c1f" = profil High (meilleure qualité sur iPhone récent)
 rtc_latency_ms = 120          # jitter buffer WebRTC
 
 [video]
-width = 1920
+width = 1920                  # taille du canevas des scènes (la sortie suit l'écran)
 height = 1080
-fps = 30
 
 [output]
 display = "HDMI"              # sous-chaîne du nom de l'écran, ou index (voir `streame devices`)
@@ -151,23 +153,27 @@ Les fichiers vidéo avec couche alpha (ProRes 4444, WebM VP9 alpha…) sont comp
 
 | Module | Rôle |
 | --- | --- |
-| `src/engine.rs` | Pipeline GStreamer principal : source téléphone (`intervideosrc`), une `compositor` par scène, mélangeur programme (transitions par alpha/zorder), `input-selector` de preview, `compositor` multiview, routage audio (`audioconvert mix-matrix`), sorties vers les fenêtres (`appsink`). |
-| `src/webrtc.rs` | Une session `webrtcbin` par téléphone (le Mac fait l'offre) ; flux décodés poussés dans les canaux `intervideosink`/`interaudiosink` ; retour audio encodé en Opus. |
-| `src/server.rs` | Serveur HTTPS axum : page téléphone, WebSocket de signaling, page/WebSocket de contrôle, API REST. |
-| `src/ui.rs` | Fenêtres natives winit + softbuffer : programme (plein écran sur l'écran choisi) et multiview (clics, clavier, cadres rouge/vert). |
+| `src/engine.rs` | État de la régie (scènes, programme, preview, transitions), chargement des calques (PNG, texte, fichiers vidéo via `uridecodebin` → `appsink` en boucle), routage audio (`audioconvert mix-matrix`). |
+| `src/render.rs` | Rendu wgpu : chaque scène dans une texture hors écran, fondu programme, tuiles/cadres/libellés du multiview, conversion NV12 → RGB dans le shader. |
+| `src/frame.rs` | Emplacements d'images partagés entre GStreamer et le rendu (dernière image + compteur i/s). |
+| `src/webrtc.rs` | Une session `webrtcbin` par téléphone (le Mac fait l'offre) ; vidéo décodée vers le GPU via `appsink`, audio vers `interaudiosink` ; retour audio encodé en Opus. |
+| `src/server.rs` | Serveur HTTPS axum : page téléphone, WebSocket de signaling, page/WebSocket de contrôle, API REST (avec statistiques). |
+| `src/ui.rs` | Fenêtres winit : programme (plein écran sur l'écran choisi) et multiview (clics, clavier), rendu cadencé sur la fréquence de l'écran. |
 | `src/streamdeck.rs` | Thread Stream Deck (hidapi) : rendu des touches, actions, reconnexion. |
+| `src/text.rs` | Rendu de texte (police DejaVu embarquée) pour les libellés et les touches. |
 | `src/audio.rs` | Énumération des périphériques (GstDeviceMonitor), matrices de routage. |
 | `src/config.rs` | Modèle de configuration TOML. |
 | `web/` | Pages téléphone et contrôle (embarquées dans le binaire). |
 
-Les fenêtres reçoivent des images BGRx déjà à leur taille (mise à l'échelle GStreamer), copiées
-dans un tampon `softbuffer` ; la fenêtre programme suit l'écran HDMI choisi (`Fullscreen::Borderless`).
+Les fenêtres sont des surfaces wgpu ; la fenêtre programme suit l'écran HDMI choisi
+(`Fullscreen::Borderless`) et cadence le rendu de l'ensemble à la fréquence de cet écran.
+Le multiview affiche les statistiques (résolution et i/s du téléphone, i/s du rendu), aussi
+disponibles dans `GET /api/state`.
 
 ## Limites connues / pistes
 
 - Un seul téléphone simultané (le canal « phone » est unique) ; plusieurs sources = plusieurs canaux à ajouter.
-- Les compositors tournent en logiciel (`compositor`) : un Mac Apple Silicon tient 1080p30 avec quelques scènes ;
-  pour 4K, passer à `glvideomixer` serait la suite logique.
+- Les fichiers vidéo sont décodés par GStreamer et envoyés au GPU image par image (suffisant pour des overlays 1080p).
 - Pas de son des vidéos d'overlay (volontairement muet), pas d'enregistrement ni de streaming RTMP.
 - Le retour audio vers le téléphone est stéréo 48 kHz Opus ; l'annulation d'écho est faite côté téléphone.
 - Sur Chrome/Android, forcer `video_codec = "VP8"` si le H264 matériel n'est pas disponible.
@@ -176,5 +182,5 @@ dans un tampon `softbuffer` ; la fenêtre programme suit l'écran HDMI choisi (`
 
 Un test de bout en bout (Chromium headless avec caméra simulée) a été utilisé pendant le
 développement : offre/réponse SDP, connexion ICE, flux vidéo et audio décodés côté Rust,
-retour audio reçu par le navigateur, bascule de scènes via l'API. Sous Linux, le mode
-`--no-window` (ou l'option cachée `--fake-output`) permet de lancer le moteur sans écran.
+retour audio reçu par le navigateur, bascule de scènes via l'API. Le mode `--no-window` lance
+le moteur sans fenêtres (serveur, audio et API seulement).

@@ -25,9 +25,11 @@ futures-util = "0.3"
 local-ip-address = "0.6"
 qrcode = { version = "0.14", default-features = false }
 
-# Fenêtres (sortie HDMI + multiview)
+# Fenêtres (sortie HDMI + multiview) et rendu GPU (Metal sur macOS via wgpu)
 winit = "0.30"
-softbuffer = "0.4"
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
 
 # Stream Deck
 elgato-streamdeck = "0.13"

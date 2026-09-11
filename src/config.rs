@@ -33,6 +33,9 @@ pub struct ServerConfig {
     pub rtc_latency_ms: u32,
     /// Codec vidéo négocié avec le téléphone : "H264" ou "VP8".
     pub video_codec: String,
+    /// Profil H264 proposé (SDP `profile-level-id`) : "42e01f" (baseline, universel)
+    /// ou "640c1f" (high, meilleure qualité à débit égal sur iPhone récent).
+    pub h264_profile_level_id: String,
     /// Débit Opus vers le téléphone (retour audio), en bit/s.
     pub return_audio_bitrate: i32,
 }
@@ -45,6 +48,7 @@ impl Default for ServerConfig {
             stun_server: "stun://stun.l.google.com:19302".into(),
             rtc_latency_ms: 120,
             video_codec: "H264".into(),
+            h264_profile_level_id: "42e01f".into(),
             return_audio_bitrate: 64000,
         }
     }

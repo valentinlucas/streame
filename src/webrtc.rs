@@ -5,7 +5,7 @@
 //! `intervideosink` / `interaudiosink` consommés par le moteur principal.
 
 use crate::config::Config;
-use crate::engine::{Engine, PHONE_AUDIO_CHANNEL, PHONE_VIDEO_CHANNEL, RETURN_AUDIO_CHANNEL};
+use crate::engine::{frame_appsink, Engine, PHONE_AUDIO_CHANNEL, RETURN_AUDIO_CHANNEL};
 use anyhow::{Context, Result};
 use gst::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -137,7 +137,10 @@ impl PhoneSession {
             vb.field("encoding-name", "H264")
                 .field("payload", 102i32)
                 .field("packetization-mode", "1")
-                .field("profile-level-id", "42e01f")
+                .field(
+                    "profile-level-id",
+                    cfg.server.h264_profile_level_id.as_str(),
+                )
                 .field("level-asymmetry-allowed", "1")
         };
         let video_caps = vb.build();
@@ -232,11 +235,12 @@ impl PhoneSession {
         }
         {
             let pipeline = pipeline.clone();
+            let engine = engine.clone();
             webrtc.connect_pad_added(move |_, pad| {
                 if pad.direction() != gst::PadDirection::Src {
                     return;
                 }
-                if let Err(e) = Self::on_incoming_stream(&pipeline, pad) {
+                if let Err(e) = Self::on_incoming_stream(&pipeline, pad, &engine) {
                     error!("flux entrant : {e:#}");
                 }
             });
@@ -277,12 +281,17 @@ impl PhoneSession {
     }
 
     /// Un flux RTP décodable arrive du téléphone : on le décode et on l'envoie au moteur.
-    fn on_incoming_stream(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()> {
+    fn on_incoming_stream(
+        pipeline: &gst::Pipeline,
+        pad: &gst::Pad,
+        engine: &Arc<Engine>,
+    ) -> Result<()> {
         let decode = gst::ElementFactory::make("decodebin").build()?;
         pipeline.add(&decode)?;
         decode.sync_state_with_parent()?;
         pad.link(&decode.static_pad("sink").unwrap())?;
         let pipe = pipeline.clone();
+        let engine = engine.clone();
         decode.connect_pad_added(move |_, dpad| {
             let Some(caps) = dpad.current_caps() else {
                 return;
@@ -290,13 +299,21 @@ impl PhoneSession {
             let Some(s) = caps.structure(0) else { return };
             let media = s.name().to_string();
             let res: Result<()> = (|| {
-                let q = gst::ElementFactory::make("queue").build()?;
+                let q = gst::ElementFactory::make("queue")
+                    .property("max-size-buffers", 2u32)
+                    .property("max-size-time", 0u64)
+                    .property("max-size-bytes", 0u32)
+                    .property_from_str("leaky", "downstream")
+                    .build()?;
                 let chain: Vec<gst::Element> = if media.starts_with("video/") {
+                    // Décodé (vtdec → NV12) puis envoyé tel quel au GPU, sans synchronisation :
+                    // le jitter buffer WebRTC a déjà lissé le flux, on affiche au plus tôt.
                     let conv = gst::ElementFactory::make("videoconvert").build()?;
-                    let sink = gst::ElementFactory::make("intervideosink")
-                        .property("channel", PHONE_VIDEO_CHANNEL)
+                    let cf = gst::ElementFactory::make("capsfilter")
+                        .property("caps", crate::engine::gpu_caps())
                         .build()?;
-                    vec![q, conv, sink]
+                    let sink = frame_appsink(engine.phone_slot().clone(), false);
+                    vec![q, conv, cf, sink.upcast()]
                 } else if media.starts_with("audio/") {
                     let conv = gst::ElementFactory::make("audioconvert").build()?;
                     let res = gst::ElementFactory::make("audioresample").build()?;

@@ -1,4 +1,4 @@
-//! Disposition des tuiles du multiview (partagée entre GStreamer et la fenêtre).
+//! Disposition des tuiles du multiview (rendu et détection des clics).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -12,23 +12,10 @@ impl Rect {
     pub fn contains(&self, px: i32, py: i32) -> bool {
         px >= self.x && py >= self.y && px < self.x + self.w && py < self.y + self.h
     }
-
-    /// Met à l'échelle un rectangle du canevas vers une autre taille.
-    pub fn scaled(&self, from: (i32, i32), to: (i32, i32)) -> Rect {
-        let sx = to.0 as f64 / from.0.max(1) as f64;
-        let sy = to.1 as f64 / from.1.max(1) as f64;
-        Rect {
-            x: (self.x as f64 * sx).round() as i32,
-            y: (self.y as f64 * sy).round() as i32,
-            w: (self.w as f64 * sx).round() as i32,
-            h: (self.h as f64 * sy).round() as i32,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct MultiviewLayout {
-    pub canvas: (i32, i32),
     pub program: Rect,
     pub preview: Rect,
     pub tiles: Vec<Rect>,
@@ -74,7 +61,6 @@ pub fn compute(canvas_w: i32, canvas_h: i32, scene_count: usize, columns: u32) -
         ));
     }
     MultiviewLayout {
-        canvas: (canvas_w, canvas_h),
         program,
         preview,
         tiles,
