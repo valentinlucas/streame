@@ -43,7 +43,7 @@ Pilotage par Stream Deck, multiview cliquable, page web de contrôle et API HTTP
 # 1. Outils
 xcode-select --install
 curl https://sh.rustup.rs -sSf | sh          # Rust
-brew install gstreamer pkg-config           # GStreamer (formule unifiée : base/good/bad/ugly/libav)
+brew install gstreamer libnice-gstreamer pkg-config   # GStreamer (formule unifiée) + plugin ICE pour WebRTC
 
 # 2. Compilation
 export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$PKG_CONFIG_PATH"
@@ -54,9 +54,11 @@ cargo build --release
 ./target/release/streame devices             # liste cartes son (nom, canaux) et écrans
 ```
 
-> Si `brew install gstreamer` ne fournit pas `webrtcbin`/`nicesrc`, installez aussi `libnice` et
-> vérifiez que `gst-inspect-1.0 webrtcbin` fonctionne. Les binaires GStreamer officiels
-> (gstreamer.freedesktop.org, paquet « development ») fonctionnent aussi.
+> Homebrew livre le plugin `nice` (ICE, indispensable à `webrtcbin`) dans la formule séparée
+> `libnice-gstreamer` ; sans elle, `streame check` signale `nicesrc` manquant. Les avertissements
+> `GLib-GIRepository` du scanner de plugins au premier lancement viennent du plugin Python de
+> GStreamer et sont sans conséquence. Les binaires GStreamer officiels (gstreamer.freedesktop.org,
+> paquet « development ») fonctionnent aussi.
 
 Permissions macOS : au premier lancement, autoriser l'accès **au micro** (carte son) et,
 pour le Stream Deck, fermer l'application Elgato (elle monopolise l'appareil).
