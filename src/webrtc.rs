@@ -2,13 +2,11 @@
 //!
 //! Le Mac est l'« offreur » : il propose un flux audio bidirectionnel (retour vers le
 //! téléphone) et une réception vidéo. La vidéo décodée est envoyée au rendu GPU via un
-//! `appsink`, l'audio au moteur principal via `interaudiosink`. Des statistiques RTP sont
+//! `appsink`, l'audio au moteur principal via un `appsrc` « leaky ». Des statistiques RTP sont
 //! relevées chaque seconde (`get-stats`).
 
 use crate::config::Config;
-use crate::engine::{
-    frame_appsink, Engine, PhoneStats, RtpStats, PHONE_AUDIO_CHANNEL, RETURN_AUDIO_CHANNEL,
-};
+use crate::engine::{frame_appsink, Engine, PhoneStats, RtpStats, RETURN_AUDIO_CHANNEL};
 use anyhow::{Context, Result};
 use gst::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -375,12 +373,38 @@ impl PhoneSession {
                     let sink = frame_appsink(engine.phone_slot().clone(), false);
                     vec![q, conv, cf, sink.upcast()]
                 } else if media.starts_with("audio/") {
+                    // Le son décodé est poussé (F32 stéréo 48 kHz) dans l'appsrc « leaky » du
+                    // moteur : plus de pont interaudio qui accumulait de la latence.
                     let conv = gst::ElementFactory::make("audioconvert").build()?;
                     let res = gst::ElementFactory::make("audioresample").build()?;
-                    let sink = gst::ElementFactory::make("interaudiosink")
-                        .property("channel", PHONE_AUDIO_CHANNEL)
+                    let caps = gst::Caps::builder("audio/x-raw")
+                        .field("format", "F32LE")
+                        .field("layout", "interleaved")
+                        .field("rate", 48000i32)
+                        .field("channels", 2i32)
+                        .build();
+                    let cf = gst::ElementFactory::make("capsfilter")
+                        .property("caps", &caps)
                         .build()?;
-                    vec![q, conv, res, sink]
+                    let sink = gst_app::AppSink::builder()
+                        .caps(&caps)
+                        .sync(false)
+                        .max_buffers(4)
+                        .drop(true)
+                        .build();
+                    let eng = engine.clone();
+                    sink.set_callbacks(
+                        gst_app::AppSinkCallbacks::builder()
+                            .new_sample(move |s| {
+                                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                                if let Some(buf) = sample.buffer_owned() {
+                                    eng.push_phone_audio(buf);
+                                }
+                                Ok(gst::FlowSuccess::Ok)
+                            })
+                            .build(),
+                    );
+                    vec![q, conv, res, cf, sink.upcast()]
                 } else {
                     return Ok(());
                 };
