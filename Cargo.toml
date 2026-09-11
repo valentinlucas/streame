@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 # GStreamer
 gst = { package = "gstreamer", version = "0.25" }
-gst-app = { package = "gstreamer-app", version = "0.25" }
+gst-app = { package = "gstreamer-app", version = "0.25", features = ["v1_20"] }
 gst-video = { package = "gstreamer-video", version = "0.25" }
 gst-audio = { package = "gstreamer-audio", version = "0.25" }
 gst-webrtc = { package = "gstreamer-webrtc", version = "0.25" }
