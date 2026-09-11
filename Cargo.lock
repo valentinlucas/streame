@@ -2814,6 +2814,8 @@ dependencies = [
  "gstreamer-webrtc",
  "image",
  "local-ip-address",
+ "objc2-app-kit",
+ "objc2-foundation 0.2.2",
  "qrcode",
  "rcgen",
  "rustls",

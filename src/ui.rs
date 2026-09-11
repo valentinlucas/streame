@@ -54,6 +54,25 @@ impl FrameStore {
     }
 }
 
+/// Nom lisible d'un écran. Sur macOS, winit ne donne qu'un numéro de modèle : on lit
+/// `NSScreen.localizedName` (le nom affiché dans les Réglages Système, ex. « LG HDR 4K »).
+pub fn monitor_name(m: &MonitorHandle) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::MonitorHandleExtMacOS;
+        if let Some(ptr) = m.ns_screen() {
+            // SAFETY : winit renvoie un pointeur NSScreen valide tant que le MonitorHandle vit.
+            let screen: &objc2_app_kit::NSScreen =
+                unsafe { &*(ptr as *const objc2_app_kit::NSScreen) };
+            let name = unsafe { screen.localizedName() }.to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    m.name().unwrap_or_else(|| "?".into())
+}
+
 struct WindowState {
     target: Target,
     window: Arc<Window>,
@@ -107,16 +126,13 @@ impl App {
             let low = sel.to_lowercase();
             if let Some(m) = monitors
                 .iter()
-                .find(|m| m.name().unwrap_or_default().to_lowercase().contains(&low))
+                .find(|m| monitor_name(m).to_lowercase().contains(&low))
             {
                 return Some(m.clone());
             }
             warn!(
                 "écran « {sel} » introuvable ; écrans : {:?}",
-                monitors
-                    .iter()
-                    .map(|m| m.name().unwrap_or_default())
-                    .collect::<Vec<_>>()
+                monitors.iter().map(monitor_name).collect::<Vec<_>>()
             );
         }
         if prefer_secondary {
@@ -177,7 +193,7 @@ impl App {
             "fenêtre {title} sur « {} » ({}x{})",
             monitor
                 .as_ref()
-                .and_then(|m| m.name())
+                .map(monitor_name)
                 .unwrap_or_else(|| "?".into()),
             inner.width,
             inner.height
@@ -380,7 +396,7 @@ impl ApplicationHandler for MonitorLister {
                 let s = m.size();
                 let p = m.position();
                 MonitorInfo {
-                    name: m.name().unwrap_or_else(|| "?".into()),
+                    name: monitor_name(&m),
                     width: s.width,
                     height: s.height,
                     x: p.x,
