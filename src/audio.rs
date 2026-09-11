@@ -172,8 +172,13 @@ pub fn to_gst_matrix(m: &[Vec<f32>]) -> gst::Array {
 /// Caps audio brutes pour N canaux. Le masque de canaux est laissé libre :
 /// avec `mix-matrix`, audioconvert ignore les positions et prend celles du périphérique.
 pub fn raw_caps(rate: i32, channels: i32) -> gst::Caps {
-    gst::Caps::builder("audio/x-raw")
+    let mut b = gst::Caps::builder("audio/x-raw")
         .field("rate", rate)
-        .field("channels", channels)
-        .build()
+        .field("channels", channels);
+    // Au-delà de 2 canaux, on adresse directement les canaux physiques de la carte
+    // (non positionnés) : sans masque, la négociation multicanal échoue avec osxaudiosink.
+    if channels > 2 {
+        b = b.field("channel-mask", gst::Bitmask::new(0));
+    }
+    b.build()
 }

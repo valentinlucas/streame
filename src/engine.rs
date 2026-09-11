@@ -644,6 +644,25 @@ impl Engine {
         if let Some((sink, out_ch)) =
             audio::make_device_element(&a.output_device, audio::Direction::Sink, a.output_channels)?
         {
+            // `out_ch` est le nombre de canaux que macOS expose pour cette sortie (osxaudiosink
+            // négocie sur le format courant du périphérique). Un routage vers un canal au-delà
+            // est ignoré avec un avertissement : il faut alors augmenter le nombre de canaux USB
+            // de sortie de la carte (voir README), sinon ces canaux n'existent pas côté système.
+            let max_route = a
+                .stream_output_channels
+                .iter()
+                .chain(a.branding_output_channels.iter())
+                .copied()
+                .max()
+                .unwrap_or(0) as i32;
+            if max_route > out_ch {
+                warn!(
+                    "audio sortie « {} » : routage vers le canal {max_route} mais la carte n'expose \
+                     que {out_ch} sorties à macOS. Augmentez les canaux USB de sortie de la carte \
+                     (Audio MIDI Setup / config USB de la Wing).",
+                    a.output_device
+                );
+            }
             ctl.out_channels = out_ch;
             route.out_channels = out_ch;
 
