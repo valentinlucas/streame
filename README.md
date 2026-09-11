@@ -44,7 +44,12 @@ téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôl
 - **Contrôle distant** : `https://<ip>:8443/control` (tablette, second téléphone…) et API HTTP
   (`POST /api/program/<id>`, `/api/cut/<id>`, `/api/preview/<id>`, `/api/take`, `GET /api/state`),
   utilisable depuis Bitfocus Companion par exemple.
-- **Audio multicanal** : matrice de routage (`mix-matrix`) vers n'importe quels canaux de la Wing.
+- **Audio multicanal** : deux sources mélangées vers la carte son sur des canaux distincts.
+  Le son de l'habillage (vidéos d'overlay) et le son du stream WebRTC vont chacun sur les canaux
+  choisis de la Wing (matrice `mix-matrix`), et l'entrée choisie est renvoyée au téléphone.
+- **VU-mètres et sélection audio** : le panneau `/control` affiche les niveaux (dBFS) de chaque
+  source en temps réel (élément `level`), liste les périphériques détectés et permet de re-router
+  les canaux en direct (`GET /api/audio`).
 
 ## Installation (macOS)
 
@@ -115,10 +120,12 @@ columns = 4
 [audio]
 output_device = "WING"        # "default", "none" ou sous-chaîne du nom (voir `streame devices`)
 input_device = "WING"
-output_channels = 0           # 0 = auto (nombre max de canaux du périphérique)
+output_channels = 0                # 0 = auto (nombre max de canaux du périphérique)
 input_channels = 0
-phone_to_output_channels = [5, 6]     # son du téléphone → canaux 5/6 de la Wing (G, D)
-return_from_input_channels = [1, 2]   # entrées 1/2 de la Wing → oreillette du téléphone
+branding_output_channels = [1]     # son de l'habillage → sortie 1 de la Wing
+stream_output_channels = [2]       # son du stream WebRTC → sortie 2 de la Wing
+return_from_input_channels = [1]   # entrée 1 de la Wing → retour du téléphone
+meters = true                      # VU-mètres dans le panneau de contrôle
 
 [transition]
 kind = "fade"                 # ou "cut"

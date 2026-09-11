@@ -129,11 +129,16 @@ pub struct AudioConfig {
     pub output_channels: i32,
     /// Nombre de canaux du périphérique d'entrée (0 = auto-détection).
     pub input_channels: i32,
-    /// Canaux de sortie (1-based) recevant le son du téléphone (G, D).
-    pub phone_to_output_channels: Vec<usize>,
+    /// Canaux de sortie (1-based) recevant le son du stream WebRTC (téléphone).
+    #[serde(alias = "phone_to_output_channels")]
+    pub stream_output_channels: Vec<usize>,
+    /// Canaux de sortie (1-based) recevant le son de l'habillage (vidéos d'overlay).
+    pub branding_output_channels: Vec<usize>,
     /// Canaux d'entrée (1-based) renvoyés au téléphone (G, D).
     pub return_from_input_channels: Vec<usize>,
     pub sample_rate: i32,
+    /// VU-mètres (élément `level`) sur chaque source, visibles dans le panneau de contrôle.
+    pub meters: bool,
 }
 
 impl Default for AudioConfig {
@@ -144,9 +149,11 @@ impl Default for AudioConfig {
             input_device: "default".into(),
             output_channels: 0,
             input_channels: 0,
-            phone_to_output_channels: vec![1, 2],
-            return_from_input_channels: vec![1, 2],
+            stream_output_channels: vec![2],
+            branding_output_channels: vec![1],
+            return_from_input_channels: vec![1],
             sample_rate: 48000,
+            meters: true,
         }
     }
 }
@@ -383,8 +390,9 @@ impl Config {
         let mut cfg = Config::default();
         cfg.audio.output_device = "WING".into();
         cfg.audio.input_device = "WING".into();
-        cfg.audio.phone_to_output_channels = vec![5, 6];
-        cfg.audio.return_from_input_channels = vec![1, 2];
+        cfg.audio.branding_output_channels = vec![1]; // habillage → sortie 1
+        cfg.audio.stream_output_channels = vec![2]; // stream WebRTC → sortie 2
+        cfg.audio.return_from_input_channels = vec![1]; // entrée 1 → retour téléphone
         cfg.output.display = "HDMI".into();
         cfg.scenes = vec![
             SceneConfig {

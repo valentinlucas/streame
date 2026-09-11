@@ -78,6 +78,7 @@ pub async fn run(state: Shared, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Result<(
         .route("/api/cut/{id}", post(api_cut))
         .route("/api/preview/{id}", post(api_preview))
         .route("/api/take", post(api_take))
+        .route("/api/audio", get(api_audio))
         .with_state(state);
 
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem)
@@ -226,10 +227,21 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControlMsg {
-    Program { scene: String },
-    Cut { scene: String },
-    Preview { scene: String },
+    Program {
+        scene: String,
+    },
+    Cut {
+        scene: String,
+    },
+    Preview {
+        scene: String,
+    },
     Take,
+    /// Re-route une source audio en direct : target = "stream"|"branding"|"return".
+    AudioRoute {
+        target: String,
+        channels: Vec<usize>,
+    },
 }
 
 async fn control_ws(ws: WebSocketUpgrade, State(state): State<Shared>) -> Response {
@@ -249,6 +261,8 @@ async fn handle_control(socket: WebSocket, state: Shared) {
     {
         return;
     }
+    // Envoi périodique des VU-mètres (~15 images/s), sans surcharger l'état.
+    let mut meter_tick = tokio::time::interval(std::time::Duration::from_millis(66));
     loop {
         tokio::select! {
             msg = stream.next() => {
@@ -270,6 +284,13 @@ async fn handle_control(socket: WebSocket, state: Shared) {
                     Err(_) => break,
                 }
             }
+            _ = meter_tick.tick() => {
+                let meters = state.engine.meters();
+                if !meters.is_empty() {
+                    let json = serde_json::json!({ "type": "meters", "meters": meters }).to_string();
+                    if sink.send(Message::Text(json.into())).await.is_err() { break; }
+                }
+            }
         }
     }
 }
@@ -289,11 +310,34 @@ fn apply_control(engine: &Arc<Engine>, cmd: ControlMsg) -> bool {
             engine.take();
             true
         }
+        ControlMsg::AudioRoute { target, channels } => engine.set_audio_route(&target, &channels),
     }
 }
 
 async fn api_state(State(state): State<Shared>) -> Json<crate::engine::Snapshot> {
     Json(state.engine.snapshot())
+}
+
+/// Périphériques audio détectés et routage courant (pour l'écran de sélection audio).
+async fn api_audio(State(state): State<Shared>) -> Json<serde_json::Value> {
+    let devices: Vec<serde_json::Value> = crate::audio::list_devices()
+        .into_iter()
+        .map(|d| {
+            let dir = if d.class.contains("Sink") {
+                "sortie"
+            } else {
+                "entrée"
+            };
+            serde_json::json!({ "name": d.name, "direction": dir, "channels": d.max_channels })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "devices": devices,
+        "routing": state.engine.audio_routing(),
+        "output_device": state.cfg.audio.output_device,
+        "input_device": state.cfg.audio.input_device,
+        "sample_rate": state.cfg.audio.sample_rate,
+    }))
 }
 
 fn api_result(ok: bool, state: &Shared) -> Response {

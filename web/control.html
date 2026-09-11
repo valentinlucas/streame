@@ -6,7 +6,7 @@
 <title>Streame — contrôle</title>
 <link rel="stylesheet" href="/style.css">
 </head>
-<body>
+<body class="control">
 <h1>🎛 Streame — contrôle</h1>
 <div class="bar">
   <span id="phone" class="pill off">Téléphone : —</span>
@@ -17,8 +17,29 @@
 <div class="row">
   <button id="take">TAKE (preview → programme)</button>
 </div>
+
+<section class="panel">
+  <h2>Niveaux audio</h2>
+  <div id="meters" class="meters"></div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Sources audio</h2>
+    <button id="audio-toggle" class="ghost small">Configurer ▾</button>
+  </div>
+  <div id="audio" hidden>
+    <div id="audio-routes"></div>
+    <p class="hint">Canaux séparés par des virgules (1 = premier canal de la Wing). Appliqué en direct.</p>
+    <details>
+      <summary>Périphériques détectés</summary>
+      <div id="audio-devices" class="devices"></div>
+    </details>
+  </div>
+</section>
+
 <p style="color:#888;font-size:.85rem">Clic : preview (vert). Double-clic : passer en programme (rouge) avec transition.
-API : <code>POST /api/program/&lt;id&gt;</code>, <code>/api/cut/&lt;id&gt;</code>, <code>/api/preview/&lt;id&gt;</code>, <code>/api/take</code>, <code>GET /api/state</code>.</p>
+API : <code>POST /api/program/&lt;id&gt;</code>, <code>/api/take</code>, <code>GET /api/state</code>, <code>GET /api/audio</code>.</p>
 <script src="/control.js"></script>
 </body>
 </html>

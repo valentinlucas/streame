@@ -101,6 +101,38 @@ pub struct Snapshot {
     pub stats: Stats,
 }
 
+/// Niveau audio d'une source (VU-mètre), en dBFS par canal.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AudioMeter {
+    pub id: String,
+    pub label: String,
+    pub rms_db: Vec<f32>,
+    pub peak_db: Vec<f32>,
+}
+
+/// Affectation des canaux (1-based) pour chaque source audio.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AudioRoute {
+    /// Canaux de sortie recevant le stream WebRTC.
+    pub stream: Vec<usize>,
+    /// Canaux de sortie recevant l'habillage.
+    pub branding: Vec<usize>,
+    /// Canaux d'entrée renvoyés au téléphone.
+    pub return_input: Vec<usize>,
+    pub out_channels: i32,
+    pub in_channels: i32,
+}
+
+/// Éléments `audioconvert` (mix-matrix) modifiables à chaud pour re-router en direct.
+#[derive(Default, Clone)]
+struct AudioCtl {
+    stream_conv: Option<gst::Element>,
+    branding_conv: Option<gst::Element>,
+    return_conv: Option<gst::Element>,
+    out_channels: i32,
+    in_channels: i32,
+}
+
 /// Contenu d'un calque, prêt pour le GPU.
 pub enum LayerKind {
     Phone,
@@ -168,6 +200,10 @@ pub struct Engine {
     pub render_fps: FpsCounter,
     rtp_stats: Mutex<Option<RtpStats>>,
     phone_stats: Mutex<Option<PhoneStats>>,
+    meters: Mutex<std::collections::HashMap<String, AudioMeter>>,
+    meter_order: Vec<(String, String)>,
+    audio_ctl: AudioCtl,
+    route: Mutex<AudioRoute>,
 }
 
 fn make(factory: &str) -> Result<gst::Element> {
@@ -188,6 +224,41 @@ fn link_many(els: &[&gst::Element]) -> Result<()> {
             .with_context(|| format!("liaison {} → {}", w[0].name(), w[1].name()))?;
     }
     Ok(())
+}
+
+/// File audio courte (limite la latence de bout en bout).
+fn audio_queue() -> Result<gst::Element> {
+    Ok(gst::ElementFactory::make("queue")
+        .property("max-size-time", 200u64 * gst::ClockTime::MSECOND.nseconds())
+        .property("max-size-buffers", 0u32)
+        .property("max-size-bytes", 0u32)
+        .build()?)
+}
+
+/// Élément `level` (VU-mètre) nommé, ou `identity` si les mètres sont désactivés.
+fn level_element(name: &str, enabled: bool) -> Result<gst::Element> {
+    if !enabled {
+        return make("identity");
+    }
+    Ok(gst::ElementFactory::make("level")
+        .name(name)
+        .property("post-messages", true)
+        .property("interval", 50u64 * gst::ClockTime::MSECOND.nseconds())
+        .property("peak-ttl", 300u64 * gst::ClockTime::MSECOND.nseconds())
+        .property("peak-falloff", 20.0f64)
+        .build()?)
+}
+
+/// Extrait un tableau de dB (rms/peak) d'un message `level`.
+fn parse_level_array(s: &gst::StructureRef, field: &str) -> Vec<f32> {
+    s.get::<gst::glib::ValueArray>(field)
+        .ok()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.get::<f64>().ok().map(|x| x as f32))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Caps acceptées par le rendu GPU (NV12 de préférence : sortie native des décodeurs).
@@ -232,6 +303,20 @@ impl Engine {
         let pipeline = gst::Pipeline::with_name("streame");
         let mut next_layer_id = 1u64;
 
+        // Graphe audio d'abord : le mélangeur d'habillage doit exister avant les vidéos,
+        // dont le son s'y branche.
+        let (branding_mixer, audio_ctl, meter_order, route) = if cfg.audio.enabled {
+            match Self::build_audio(&cfg, &pipeline) {
+                Ok(x) => x,
+                Err(e) => {
+                    error!("audio désactivé : {e:#}");
+                    (None, AudioCtl::default(), Vec::new(), AudioRoute::default())
+                }
+            }
+        } else {
+            (None, AudioCtl::default(), Vec::new(), AudioRoute::default())
+        };
+
         let mut scenes = Vec::new();
         for sc in &cfg.scenes {
             let mut layers = Vec::new();
@@ -243,7 +328,8 @@ impl Engine {
                 });
             }
             for (li, lc) in cfg_layers.iter().enumerate() {
-                match Self::build_layer(&cfg, &pipeline, lc, next_layer_id) {
+                match Self::build_layer(&cfg, &pipeline, lc, next_layer_id, branding_mixer.as_ref())
+                {
                     Ok(layer) => layers.push(layer),
                     Err(e) => warn!("scène « {} », calque {} ignoré : {e:#}", sc.name, li + 1),
                 }
@@ -256,10 +342,16 @@ impl Engine {
             });
         }
 
-        if cfg.audio.enabled {
-            if let Err(e) = Self::build_audio(&cfg, &pipeline) {
-                error!("audio désactivé : {e:#}");
-            }
+        let mut meters = std::collections::HashMap::new();
+        for (id, label) in &meter_order {
+            meters.insert(
+                id.clone(),
+                AudioMeter {
+                    id: id.clone(),
+                    label: label.clone(),
+                    ..Default::default()
+                },
+            );
         }
 
         let engine = Arc::new(Engine {
@@ -277,6 +369,10 @@ impl Engine {
             render_fps: FpsCounter::new(),
             rtp_stats: Mutex::new(None),
             phone_stats: Mutex::new(None),
+            meters: Mutex::new(meters),
+            meter_order,
+            audio_ctl,
+            route: Mutex::new(route),
         });
         engine.spawn_bus_thread();
         Ok(engine)
@@ -287,6 +383,7 @@ impl Engine {
         pipeline: &gst::Pipeline,
         lc: &LayerConfig,
         id: u64,
+        branding_mixer: Option<&gst::Element>,
     ) -> Result<Layer> {
         Ok(match lc {
             LayerConfig::Phone { geometry, opacity } => Layer {
@@ -347,7 +444,14 @@ impl Engine {
                 let file = cfg.resolve(path);
                 anyhow::ensure!(file.is_file(), "vidéo introuvable : {}", file.display());
                 let slot = Arc::new(FrameSlot::new());
-                Self::build_video_player(pipeline, &file, *looped, slot.clone())?;
+                Self::build_video_player(
+                    pipeline,
+                    &file,
+                    *looped,
+                    slot.clone(),
+                    branding_mixer.cloned(),
+                    cfg.audio.sample_rate,
+                )?;
                 Layer {
                     id,
                     kind: LayerKind::Video(slot),
@@ -359,11 +463,14 @@ impl Engine {
     }
 
     /// `uridecodebin` → `appsink` (+ boucle sans coupure par seek « segment »).
+    /// Le son de la vidéo est envoyé au mélangeur d'habillage s'il existe, sinon ignoré.
     fn build_video_player(
         pipeline: &gst::Pipeline,
         file: &std::path::Path,
         looped: bool,
         slot: Arc<FrameSlot>,
+        branding_mixer: Option<gst::Element>,
+        sample_rate: i32,
     ) -> Result<()> {
         let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
         let uri = gst::glib::filename_to_uri(&file, None).context("uri du fichier vidéo")?;
@@ -395,15 +502,24 @@ impl Engine {
                     Self::setup_loop(dec, dpad);
                 }
             } else if s.name().starts_with("audio/") {
-                // Le son des vidéos d'overlay n'est pas diffusé.
-                if let Some(p) = pipe.upgrade() {
-                    if let Ok(sink) = gst::ElementFactory::make("fakesink")
-                        .property("sync", true)
-                        .build()
-                    {
-                        let _ = p.add(&sink);
-                        let _ = sink.sync_state_with_parent();
-                        let _ = dpad.link(&sink.static_pad("sink").unwrap());
+                let Some(p) = pipe.upgrade() else { return };
+                match &branding_mixer {
+                    // Son de l'habillage → mélangeur d'habillage (routé vers la Wing).
+                    Some(bmix) => {
+                        if let Err(e) = Self::link_branding_audio(&p, dpad, bmix, sample_rate) {
+                            warn!("son d'habillage non branché : {e:#}");
+                        }
+                    }
+                    // Pas de sortie audio : on jette le son.
+                    None => {
+                        if let Ok(sink) = gst::ElementFactory::make("fakesink")
+                            .property("sync", true)
+                            .build()
+                        {
+                            let _ = p.add(&sink);
+                            let _ = sink.sync_state_with_parent();
+                            let _ = dpad.link(&sink.static_pad("sink").unwrap());
+                        }
                     }
                 }
             }
@@ -473,62 +589,217 @@ impl Engine {
         });
     }
 
-    fn build_audio(cfg: &Config, pipeline: &gst::Pipeline) -> Result<()> {
+    /// Branche le son d'une vidéo d'habillage sur le mélangeur d'habillage.
+    fn link_branding_audio(
+        pipeline: &gst::Pipeline,
+        dpad: &gst::Pad,
+        bmix: &gst::Element,
+        rate: i32,
+    ) -> Result<()> {
+        let q = audio_queue()?;
+        let conv = make("audioconvert")?;
+        let rs = make("audioresample")?;
+        let cf = capsfilter(&audio::raw_caps(rate, 2))?;
+        pipeline.add_many([&q, &conv, &rs, &cf])?;
+        link_many(&[&q, &conv, &rs, &cf])?;
+        let bpad = bmix
+            .request_pad_simple("sink_%u")
+            .context("pad mélangeur habillage")?;
+        cf.static_pad("src").unwrap().link(&bpad)?;
+        for el in [&q, &conv, &rs, &cf] {
+            el.sync_state_with_parent()?;
+        }
+        dpad.link(&q.static_pad("sink").unwrap())?;
+        Ok(())
+    }
+
+    /// Construit le graphe audio. Deux sources (stream WebRTC et habillage) sont mélangées
+    /// vers la carte son sur des canaux distincts ; l'entrée est renvoyée au téléphone.
+    /// Retourne le mélangeur d'habillage (pour y brancher le son des vidéos), les éléments
+    /// re-routables à chaud, l'ordre des VU-mètres et le routage courant.
+    #[allow(clippy::type_complexity)]
+    fn build_audio(
+        cfg: &Config,
+        pipeline: &gst::Pipeline,
+    ) -> Result<(
+        Option<gst::Element>,
+        AudioCtl,
+        Vec<(String, String)>,
+        AudioRoute,
+    )> {
         let a = &cfg.audio;
-        // Téléphone → carte son
+        let rate = a.sample_rate;
+        let mut ctl = AudioCtl::default();
+        let mut branding_mixer = None;
+        let mut meters = Vec::new();
+        let mut route = AudioRoute {
+            stream: a.stream_output_channels.clone(),
+            branding: a.branding_output_channels.clone(),
+            return_input: a.return_from_input_channels.clone(),
+            out_channels: 0,
+            in_channels: 0,
+        };
+
+        // ----- Sortie vers la carte son (Wing) -----
         if let Some((sink, out_ch)) =
             audio::make_device_element(&a.output_device, audio::Direction::Sink, a.output_channels)?
         {
-            let src = gst::ElementFactory::make("interaudiosrc")
-                .property("channel", PHONE_AUDIO_CHANNEL)
-                .build()?;
-            let c1 = make("audioconvert")?;
-            let r1 = make("audioresample")?;
-            let cf1 = capsfilter(&audio::raw_caps(a.sample_rate, 2))?;
-            let matrix = audio::route_matrix(2, out_ch as usize, &a.phone_to_output_channels);
-            let c2 = gst::ElementFactory::make("audioconvert")
-                .property("mix-matrix", audio::to_gst_matrix(&matrix))
-                .build()?;
-            let cf2 = capsfilter(&audio::raw_caps(a.sample_rate, out_ch))?;
-            let q = gst::ElementFactory::make("queue")
-                .property("max-size-time", 200u64 * gst::ClockTime::MSECOND.nseconds())
-                .build()?;
-            pipeline.add_many([&src, &c1, &r1, &cf1, &c2, &cf2, &q, &sink])?;
-            link_many(&[&src, &c1, &r1, &cf1, &c2, &cf2, &q, &sink])?;
+            ctl.out_channels = out_ch;
+            route.out_channels = out_ch;
+
+            let out_mixer = make("audiomixer")?;
+            let out_caps = capsfilter(&audio::raw_caps(rate, out_ch))?;
+            let out_q = audio_queue()?;
+            pipeline.add_many([&out_mixer, &out_caps, &out_q, &sink])?;
+            link_many(&[&out_mixer, &out_caps, &out_q, &sink])?;
+
+            // Branche STREAM (téléphone WebRTC) → canaux stream_output_channels.
+            {
+                let src = gst::ElementFactory::make("interaudiosrc")
+                    .property("channel", PHONE_AUDIO_CHANNEL)
+                    .build()?;
+                let c1 = make("audioconvert")?;
+                let r1 = make("audioresample")?;
+                let cf1 = capsfilter(&audio::raw_caps(rate, 2))?;
+                let level = level_element("level_stream", a.meters)?;
+                let matrix = audio::route_matrix(2, out_ch as usize, &a.stream_output_channels);
+                let conv = gst::ElementFactory::make("audioconvert")
+                    .property("mix-matrix", audio::to_gst_matrix(&matrix))
+                    .build()?;
+                let cf2 = capsfilter(&audio::raw_caps(rate, out_ch))?;
+                pipeline.add_many([&src, &c1, &r1, &cf1, &level, &conv, &cf2])?;
+                link_many(&[&src, &c1, &r1, &cf1, &level, &conv, &cf2])?;
+                let mpad = out_mixer
+                    .request_pad_simple("sink_%u")
+                    .context("pad mélangeur sortie (stream)")?;
+                cf2.static_pad("src").unwrap().link(&mpad)?;
+                ctl.stream_conv = Some(conv);
+                meters.push(("stream".to_string(), "Stream (téléphone)".to_string()));
+            }
+
+            // Branche HABILLAGE → canaux branding_output_channels.
+            {
+                let bmix = make("audiomixer")?;
+                // Source de silence : garde la branche active même sans vidéo d'habillage.
+                let silence = gst::ElementFactory::make("audiotestsrc")
+                    .property("is-live", true)
+                    .property_from_str("wave", "silence")
+                    .build()?;
+                let silence_caps = capsfilter(&audio::raw_caps(rate, 2))?;
+                pipeline.add_many([&bmix, &silence, &silence_caps])?;
+                link_many(&[&silence, &silence_caps])?;
+                let bpad0 = bmix
+                    .request_pad_simple("sink_%u")
+                    .context("pad silence habillage")?;
+                silence_caps.static_pad("src").unwrap().link(&bpad0)?;
+
+                let bcaps = capsfilter(&audio::raw_caps(rate, 2))?;
+                let level = level_element("level_branding", a.meters)?;
+                let matrix = audio::route_matrix(2, out_ch as usize, &a.branding_output_channels);
+                let conv = gst::ElementFactory::make("audioconvert")
+                    .property("mix-matrix", audio::to_gst_matrix(&matrix))
+                    .build()?;
+                let cf2 = capsfilter(&audio::raw_caps(rate, out_ch))?;
+                pipeline.add_many([&bcaps, &level, &conv, &cf2])?;
+                link_many(&[&bmix, &bcaps, &level, &conv, &cf2])?;
+                let mpad = out_mixer
+                    .request_pad_simple("sink_%u")
+                    .context("pad mélangeur sortie (habillage)")?;
+                cf2.static_pad("src").unwrap().link(&mpad)?;
+                ctl.branding_conv = Some(conv);
+                branding_mixer = Some(bmix);
+                meters.push(("branding".to_string(), "Habillage".to_string()));
+            }
+
             info!(
-                "audio : téléphone → sortie canaux {:?} ({} canaux)",
-                a.phone_to_output_channels, out_ch
+                "audio sortie « {} » ({} canaux) : habillage→{:?}, stream→{:?}",
+                a.output_device, out_ch, a.branding_output_channels, a.stream_output_channels
             );
         }
-        // Carte son → téléphone (retour)
+
+        // ----- Retour de la carte son → téléphone -----
         if let Some((src, in_ch)) =
             audio::make_device_element(&a.input_device, audio::Direction::Source, a.input_channels)?
         {
+            ctl.in_channels = in_ch;
+            route.in_channels = in_ch;
             let cf0 = capsfilter(
                 &gst::Caps::builder("audio/x-raw")
                     .field("channels", in_ch)
                     .build(),
             )?;
             let matrix = audio::select_matrix(in_ch as usize, 2, &a.return_from_input_channels);
-            let c1 = gst::ElementFactory::make("audioconvert")
+            let conv = gst::ElementFactory::make("audioconvert")
                 .property("mix-matrix", audio::to_gst_matrix(&matrix))
                 .build()?;
-            let cf1 = capsfilter(&audio::raw_caps(a.sample_rate, 2))?;
+            let cf1 = capsfilter(&audio::raw_caps(rate, 2))?;
+            let level = level_element("level_return", a.meters)?;
             let r1 = make("audioresample")?;
-            let q = gst::ElementFactory::make("queue")
-                .property("max-size-time", 200u64 * gst::ClockTime::MSECOND.nseconds())
-                .build()?;
+            let q = audio_queue()?;
             let sink = gst::ElementFactory::make("interaudiosink")
                 .property("channel", RETURN_AUDIO_CHANNEL)
                 .build()?;
-            pipeline.add_many([&src, &cf0, &c1, &cf1, &r1, &q, &sink])?;
-            link_many(&[&src, &cf0, &c1, &cf1, &r1, &q, &sink])?;
+            pipeline.add_many([&src, &cf0, &conv, &cf1, &level, &r1, &q, &sink])?;
+            link_many(&[&src, &cf0, &conv, &cf1, &level, &r1, &q, &sink])?;
+            ctl.return_conv = Some(conv);
+            meters.push(("return".to_string(), "Retour Wing".to_string()));
             info!(
-                "audio : retour vers le téléphone depuis les entrées {:?} ({} canaux)",
-                a.return_from_input_channels, in_ch
+                "audio retour « {} » ({} canaux) : entrées {:?} → téléphone",
+                a.input_device, in_ch, a.return_from_input_channels
             );
         }
-        Ok(())
+
+        Ok((branding_mixer, ctl, meters, route))
+    }
+
+    /// Change à chaud les canaux d'une source audio (mix-matrix de l'`audioconvert`).
+    pub fn set_audio_route(&self, target: &str, channels: &[usize]) -> bool {
+        let ctl = &self.audio_ctl;
+        let (conv, matrix) = match target {
+            "stream" => (
+                ctl.stream_conv.clone(),
+                audio::route_matrix(2, ctl.out_channels as usize, channels),
+            ),
+            "branding" => (
+                ctl.branding_conv.clone(),
+                audio::route_matrix(2, ctl.out_channels as usize, channels),
+            ),
+            "return" => (
+                ctl.return_conv.clone(),
+                audio::select_matrix(ctl.in_channels as usize, 2, channels),
+            ),
+            _ => (None, Vec::new()),
+        };
+        let Some(conv) = conv else { return false };
+        conv.set_property("mix-matrix", audio::to_gst_matrix(&matrix));
+        let mut route = self.route.lock().unwrap();
+        match target {
+            "stream" => route.stream = channels.to_vec(),
+            "branding" => route.branding = channels.to_vec(),
+            "return" => route.return_input = channels.to_vec(),
+            _ => {}
+        }
+        info!("audio : {target} re-routé vers {channels:?}");
+        true
+    }
+
+    pub fn audio_routing(&self) -> AudioRoute {
+        self.route.lock().unwrap().clone()
+    }
+
+    pub fn meters(&self) -> Vec<AudioMeter> {
+        let m = self.meters.lock().unwrap();
+        self.meter_order
+            .iter()
+            .map(|(id, label)| {
+                m.get(id).cloned().unwrap_or_else(|| AudioMeter {
+                    id: id.clone(),
+                    label: label.clone(),
+                    rms_db: vec![-100.0; 2],
+                    peak_db: vec![-100.0; 2],
+                })
+            })
+            .collect()
     }
 
     fn spawn_bus_thread(self: &Arc<Self>) {
@@ -554,6 +825,33 @@ impl Engine {
                                 w.src().map(|s| s.path_string()).unwrap_or_default(),
                                 w.error()
                             );
+                        }
+                        MessageView::Element(_) => {
+                            if let (Some(engine), Some(s)) = (weak.upgrade(), msg.structure()) {
+                                if s.name() == "level" {
+                                    let id = msg.src().and_then(|src| match src.name().as_str() {
+                                        "level_stream" => Some("stream"),
+                                        "level_branding" => Some("branding"),
+                                        "level_return" => Some("return"),
+                                        _ => None,
+                                    });
+                                    if let Some(id) = id {
+                                        let label = engine
+                                            .meter_order
+                                            .iter()
+                                            .find(|(i, _)| i == id)
+                                            .map(|(_, l)| l.clone())
+                                            .unwrap_or_default();
+                                        let meter = AudioMeter {
+                                            id: id.to_string(),
+                                            label,
+                                            rms_db: parse_level_array(s, "rms"),
+                                            peak_db: parse_level_array(s, "peak"),
+                                        };
+                                        engine.meters.lock().unwrap().insert(id.to_string(), meter);
+                                    }
+                                }
+                            }
                         }
                         MessageView::Latency(_) => {
                             if let Some(engine) = weak.upgrade() {
@@ -804,6 +1102,9 @@ pub fn check_elements() -> Vec<&'static str> {
         "queue",
         "interaudiosrc",
         "interaudiosink",
+        "audiomixer",
+        "level",
+        "audiotestsrc",
         "decodebin",
         "uridecodebin",
         "audioconvert",
