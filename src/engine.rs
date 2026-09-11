@@ -8,8 +8,7 @@
 //! pipeline WebRTC ─ vtdec ─ appsink ─► FrameSlot(phone) ─┐
 //! uridecodebin (overlay.mp4) ─ appsink ─► FrameSlot(vidéo) ─┼─► rendu wgpu/Metal ─► HDMI + multiview
 //! PNG / texte (décodés au démarrage) ────────────────────────┘
-//! pipeline WebRTC ─ décode audio ─ appsink ─► appsrc(leaky) ─ mix-matrix ─┐
-//! habillage (vidéos) ─ mix-matrix ─────────────────────────────────────────┼─► audiomixer ─► CoreAudio (Wing)
+//! interaudiosrc(phone) ─ audioconvert(mix-matrix) ─► carte son (Wing)
 //! carte son (Wing) ─ audioconvert(mix-matrix) ─► interaudiosink(return) ─► téléphone
 //! ```
 
@@ -28,6 +27,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 /// Canaux audio inter-pipelines (partagés avec le pipeline WebRTC).
+pub const PHONE_AUDIO_CHANNEL: &str = "streame-phone-audio";
 pub const RETURN_AUDIO_CHANNEL: &str = "streame-return-audio";
 
 pub const NO_PHONE_TEXT: &str = "EN ATTENTE DU TÉLÉPHONE";
@@ -206,8 +206,6 @@ pub struct Engine {
     route: Mutex<AudioRoute>,
     /// Objets maintenus en vie (flux de sortie CoreAudio) tant que le moteur existe.
     _audio_keepalive: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
-    /// Point d'injection du son du téléphone (rempli par la session WebRTC).
-    phone_audio_src: Option<gst_app::AppSrc>,
 }
 
 fn make(factory: &str) -> Result<gst::Element> {
@@ -309,32 +307,30 @@ impl Engine {
 
         // Graphe audio d'abord : le mélangeur d'habillage doit exister avant les vidéos,
         // dont le son s'y branche.
-        let (branding_mixer, audio_ctl, meter_order, route, audio_keepalive, phone_audio_src) =
-            if cfg.audio.enabled {
-                match Self::build_audio(&cfg, &pipeline) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        error!("audio désactivé : {e:#}");
-                        (
-                            None,
-                            AudioCtl::default(),
-                            Vec::new(),
-                            AudioRoute::default(),
-                            Vec::new(),
-                            None,
-                        )
-                    }
+        let (branding_mixer, audio_ctl, meter_order, route, audio_keepalive) = if cfg.audio.enabled
+        {
+            match Self::build_audio(&cfg, &pipeline) {
+                Ok(x) => x,
+                Err(e) => {
+                    error!("audio désactivé : {e:#}");
+                    (
+                        None,
+                        AudioCtl::default(),
+                        Vec::new(),
+                        AudioRoute::default(),
+                        Vec::new(),
+                    )
                 }
-            } else {
-                (
-                    None,
-                    AudioCtl::default(),
-                    Vec::new(),
-                    AudioRoute::default(),
-                    Vec::new(),
-                    None,
-                )
-            };
+            }
+        } else {
+            (
+                None,
+                AudioCtl::default(),
+                Vec::new(),
+                AudioRoute::default(),
+                Vec::new(),
+            )
+        };
 
         let mut scenes = Vec::new();
         for sc in &cfg.scenes {
@@ -393,7 +389,6 @@ impl Engine {
             audio_ctl,
             route: Mutex::new(route),
             _audio_keepalive: Mutex::new(audio_keepalive),
-            phone_audio_src,
         });
         engine.spawn_bus_thread();
         Ok(engine)
@@ -648,13 +643,11 @@ impl Engine {
         Vec<(String, String)>,
         AudioRoute,
         Vec<Box<dyn std::any::Any + Send>>,
-        Option<gst_app::AppSrc>,
     )> {
         let a = &cfg.audio;
         let rate = a.sample_rate;
         let mut ctl = AudioCtl::default();
         let mut branding_mixer = None;
-        let mut phone_audio_src: Option<gst_app::AppSrc> = None;
         let mut meters = Vec::new();
         // Objets à garder en vie tant que le moteur tourne (flux CoreAudio de sortie).
         let mut keepalives: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
@@ -695,28 +688,10 @@ impl Engine {
                 .context("liaison mélangeur sortie → sortie audio")?;
 
             // Branche STREAM (téléphone WebRTC) → canaux stream_output_channels.
-            // Le son du téléphone (autre pipeline, autre horloge) arrive par un appsrc « leaky » :
-            // si l'horloge du téléphone dérive, on jette le plus ancien au lieu de laisser la
-            // latence grossir (le pont interaudiosink/src accumulait sinon plusieurs secondes).
             {
-                let stream_caps = gst::Caps::builder("audio/x-raw")
-                    .field("format", "F32LE")
-                    .field("layout", "interleaved")
-                    .field("rate", rate)
-                    .field("channels", 2)
-                    .build();
-                let src = gst_app::AppSrc::builder()
-                    .caps(&stream_caps)
-                    .is_live(true)
-                    .format(gst::Format::Time)
-                    .do_timestamp(true)
-                    // Latence bornée : sinon la source live répond « illimité » à la requête de
-                    // latence et le mélangeur (aggregator) échoue avec une erreur d'horloge.
-                    .min_latency(0)
-                    .max_latency(150_000_000) // 150 ms en ns
-                    .max_time(gst::ClockTime::from_mseconds(150))
-                    .leaky_type(gst_app::AppLeakyType::Downstream)
-                    .build();
+                let src = gst::ElementFactory::make("interaudiosrc")
+                    .property("channel", PHONE_AUDIO_CHANNEL)
+                    .build()?;
                 let c1 = make("audioconvert")?;
                 let r1 = make("audioresample")?;
                 let cf1 = capsfilter(&audio::raw_caps(rate, 2))?;
@@ -726,14 +701,13 @@ impl Engine {
                     .property("mix-matrix", audio::to_gst_matrix(&matrix))
                     .build()?;
                 let cf2 = capsfilter(&audio::raw_caps(rate, out_ch))?;
-                pipeline.add_many([src.upcast_ref(), &c1, &r1, &cf1, &level, &conv, &cf2])?;
-                link_many(&[src.upcast_ref(), &c1, &r1, &cf1, &level, &conv, &cf2])?;
+                pipeline.add_many([&src, &c1, &r1, &cf1, &level, &conv, &cf2])?;
+                link_many(&[&src, &c1, &r1, &cf1, &level, &conv, &cf2])?;
                 let mpad = out_mixer
                     .request_pad_simple("sink_%u")
                     .context("pad mélangeur sortie (stream)")?;
                 cf2.static_pad("src").unwrap().link(&mpad)?;
                 ctl.stream_conv = Some(conv);
-                phone_audio_src = Some(src);
                 meters.push(("stream".to_string(), "Stream (téléphone)".to_string()));
             }
 
@@ -809,14 +783,7 @@ impl Engine {
             );
         }
 
-        Ok((
-            branding_mixer,
-            ctl,
-            meters,
-            route,
-            keepalives,
-            phone_audio_src,
-        ))
+        Ok((branding_mixer, ctl, meters, route, keepalives))
     }
 
     /// Construit la fin de la chaîne de sortie audio. Sur macOS avec une carte nommée, la
@@ -847,7 +814,7 @@ impl Engine {
                     };
                     let sr = dev_rate as i32;
                     match audio::cpal_out::start(sel, ch as u16, sr as u32) {
-                        Ok((output, pusher)) => {
+                        Ok(output) => {
                             let caps = gst::Caps::builder("audio/x-raw")
                                 .field("format", "F32LE")
                                 .field("layout", "interleaved")
@@ -861,9 +828,11 @@ impl Engine {
                             let appsink = gst_app::AppSink::builder()
                                 .caps(&caps)
                                 .sync(false)
-                                .max_buffers(4)
+                                .max_buffers(8)
                                 .drop(true)
                                 .build();
+                            let ring = output.ring.clone();
+                            let max_samples = (sr as usize) * (ch as usize) / 5; // ~200 ms
                             appsink.set_callbacks(
                                 gst_app::AppSinkCallbacks::builder()
                                     .new_sample(move |s| {
@@ -873,7 +842,7 @@ impl Engine {
                                             if let Ok(map) = buf.map_readable() {
                                                 let f: &[f32] =
                                                     bytemuck::cast_slice(map.as_slice());
-                                                pusher.push(f);
+                                                audio::cpal_out::push(&ring, f, max_samples);
                                             }
                                         }
                                         Ok(gst::FlowSuccess::Ok)
@@ -1071,14 +1040,6 @@ impl Engine {
 
     pub fn phone_slot(&self) -> &Arc<FrameSlot> {
         &self.phone
-    }
-
-    /// Injecte un tampon de son du téléphone (F32 stéréo 48 kHz) dans la sortie audio.
-    /// L'appsrc « leaky » borne la latence en cas de dérive d'horloge.
-    pub fn push_phone_audio(&self, buffer: gst::Buffer) {
-        if let Some(src) = &self.phone_audio_src {
-            let _ = src.push_buffer(buffer);
-        }
     }
 
     pub fn scenes(&self) -> Vec<SceneInfo> {

@@ -191,27 +191,18 @@ pub fn raw_caps(rate: i32, channels: i32) -> gst::Caps {
 pub mod cpal_out {
     use anyhow::{anyhow, Result};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use ringbuf::traits::{Consumer, Observer, Producer, Split};
-    use ringbuf::HeapRb;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use tracing::{error, info, warn};
+    use tracing::{error, info};
 
-    type Prod = ringbuf::HeapProd<f32>;
+    /// Tampon partagé entre l'appsink (producteur) et le flux CoreAudio (consommateur).
+    pub type Ring = Arc<Mutex<VecDeque<f32>>>;
 
-    /// Poignée d'écriture (côté appsink GStreamer). Le consommateur vit dans le thread temps
-    /// réel CoreAudio et lit sans verrou.
-    #[derive(Clone)]
-    pub struct Pusher {
-        prod: Arc<Mutex<Prod>>,
-        /// Cible de remplissage (échantillons entrelacés) = latence visée.
-        target: usize,
-        capacity: usize,
-        channels: usize,
-    }
-
-    /// Objet à garder en vie : maintient le thread et le flux CoreAudio.
+    /// Flux de sortie CoreAudio maintenu en vie (le flux cpal n'est pas `Send` : il vit dans
+    /// son propre thread).
     pub struct Output {
+        pub ring: Ring,
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -258,45 +249,31 @@ pub mod cpal_out {
         Ok(best)
     }
 
-    /// Ouvre le flux CoreAudio. Le consommateur (thread temps réel) lit le tampon sans verrou :
-    /// silence tant qu'on n'a pas atteint la cible de latence (amorçage), puis lecture continue.
-    pub fn start(name: &str, channels: u16, sample_rate: u32) -> Result<(Output, Pusher)> {
+    /// Ouvre le flux CoreAudio ; il lit `ring` (F32 entrelacé) et sort silence si sous-alimenté.
+    pub fn start(name: &str, channels: u16, sample_rate: u32) -> Result<Output> {
         let dev = find_device(name)?;
         let config = cpal::StreamConfig {
             channels,
             sample_rate: cpal::SampleRate(sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
-        let ch = channels as usize;
-        // Cible ~50 ms, capacité ~400 ms.
-        let target = (sample_rate as usize * ch * 50 / 1000).max(ch);
-        let capacity = (sample_rate as usize * ch * 400 / 1000).max(target * 2);
-        let (prod, mut cons) = HeapRb::<f32>::new(capacity).split();
-
+        let ring: Ring = Arc::new(Mutex::new(VecDeque::with_capacity(
+            sample_rate as usize * channels as usize / 4,
+        )));
         let stop = Arc::new(AtomicBool::new(false));
-        let (stop_thread, name_owned) = (stop.clone(), name.to_string());
-        // Amorçage : on démarre la lecture quand le tampon a atteint la cible, pour éviter
-        // les sous-alimentations en rafale au début.
-        let mut primed = false;
+        let (ring_cb, stop_thread, name_owned) = (ring.clone(), stop.clone(), name.to_string());
         let thread = std::thread::Builder::new()
             .name("cpal-out".into())
             .spawn(move || {
                 let stream = match dev.build_output_stream(
                     &config,
-                    move |out: &mut [f32], _| {
-                        if !primed {
-                            if cons.occupied_len() < target {
-                                out.iter_mut().for_each(|s| *s = 0.0);
-                                return;
+                    move |out: &mut [f32], _| match ring_cb.try_lock() {
+                        Ok(mut r) => {
+                            for s in out.iter_mut() {
+                                *s = r.pop_front().unwrap_or(0.0);
                             }
-                            primed = true;
                         }
-                        let got = cons.pop_slice(out);
-                        // Sous-alimentation : on complète en silence et on redemande un amorçage.
-                        if got < out.len() {
-                            out[got..].iter_mut().for_each(|s| *s = 0.0);
-                            primed = false;
-                        }
+                        Err(_) => out.iter_mut().for_each(|s| *s = 0.0),
                     },
                     |e| error!("flux CoreAudio : {e}"),
                     None,
@@ -316,43 +293,22 @@ pub mod cpal_out {
                     std::thread::park_timeout(std::time::Duration::from_millis(250));
                 }
             })?;
-
-        let pusher = Pusher {
-            prod: Arc::new(Mutex::new(prod)),
-            target,
-            capacity,
-            channels: ch,
-        };
-        Ok((
-            Output {
-                stop,
-                thread: Some(thread),
-            },
-            pusher,
-        ))
+        Ok(Output {
+            ring,
+            stop,
+            thread: Some(thread),
+        })
     }
 
-    impl Pusher {
-        /// Pousse des échantillons F32 entrelacés. Anti-dérive : si le tampon dépasse largement
-        /// la cible (l'horloge de la carte est un peu plus lente), on saute des trames récentes
-        /// pour ne pas laisser la latence grandir.
-        pub fn push(&self, samples: &[f32]) {
-            let Ok(mut prod) = self.prod.lock() else {
-                return;
-            };
-            let occupied = prod.occupied_len();
-            // Plafond dur : au-delà de la capacité, on jette (évite le blocage).
-            if occupied >= self.capacity.saturating_sub(samples.len()) {
-                // Trop en retard : on saute presque tout sauf la cible, en gardant l'alignement
-                // sur les trames (multiples du nombre de canaux).
-                let keep = self.target - (self.target % self.channels.max(1));
-                let skip = samples.len().saturating_sub(keep.min(samples.len()));
-                let start = skip - (skip % self.channels.max(1));
-                let _ = prod.push_slice(&samples[start..]);
-                warn!("sortie CoreAudio : tampon plein, trames sautées (dérive d'horloge)");
-                return;
+    /// Pousse des échantillons F32 entrelacés, en bornant la latence (jette le plus ancien).
+    pub fn push(ring: &Ring, samples: &[f32], max_samples: usize) {
+        if let Ok(mut r) = ring.lock() {
+            if r.len() + samples.len() > max_samples {
+                let len = r.len();
+                let excess = (len + samples.len()) - max_samples;
+                r.drain(0..excess.min(len));
             }
-            let _ = prod.push_slice(samples);
+            r.extend(samples.iter().copied());
         }
     }
 }
