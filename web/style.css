@@ -1,23 +1,51 @@
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
-body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #111; color: #eee; padding: 16px; }
+html, body { height: 100%; }
+body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #111; color: #eee; -webkit-text-size-adjust: 100%; }
 h1 { font-size: 1.3rem; margin: 0 0 12px; }
-label { display: block; margin: 10px 0 4px; font-size: .9rem; color: #bbb; }
+label { display: block; margin: 12px 0 4px; font-size: .9rem; color: #bbb; }
 input, select, button { font: inherit; }
-input, select { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #444; background: #222; color: #eee; }
-button { padding: 14px 18px; border: 0; border-radius: 10px; background: #2b6cff; color: #fff; font-weight: 600; width: 100%; margin-top: 14px; }
-button.secondary { background: #444; }
+input, select { width: 100%; padding: 11px; border-radius: 8px; border: 1px solid #444; background: #222; color: #eee; }
+button { border: 0; border-radius: 10px; background: #2b6cff; color: #fff; font-weight: 600; }
 button:disabled { opacity: .5; }
-#status { margin-top: 12px; padding: 10px; border-radius: 8px; background: #222; font-size: .9rem; min-height: 40px; }
-video { width: 100%; background: #000; border-radius: 10px; margin-top: 12px; aspect-ratio: 16/9; object-fit: cover; }
-.row { display: flex; gap: 10px; }
-.row > * { flex: 1; }
-.scenes { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-top: 12px; }
-.scene { padding: 18px 10px; border-radius: 10px; background: #2a2a2a; border: 3px solid transparent; text-align: center; cursor: pointer; user-select: none; }
-.scene.program { border-color: #e02020; background: #4a1a1a; }
-.scene.preview { border-color: #20c040; }
-.scene small { display: block; color: #999; font-size: .75rem; margin-top: 4px; }
-.bar { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
-.pill { padding: 6px 10px; border-radius: 999px; background: #333; font-size: .85rem; }
-.pill.on { background: #1e6b34; }
-.pill.off { background: #6b1e1e; }
+[hidden] { display: none !important; }
+
+.screen { min-height: 100%; }
+
+/* ---- Écran de réglages ---- */
+#setup { padding: 16px; padding: max(16px, env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom)); max-width: 640px; margin: 0 auto; }
+.preview-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 12px; overflow: hidden; margin-bottom: 4px; }
+#preview { width: 100%; height: 100%; object-fit: cover; display: block; background: #000; }
+#enable { position: absolute; inset: 0; width: 100%; height: 100%; background: rgba(0,0,0,.55); color: #fff; border-radius: 12px; font-weight: 600; }
+#start { width: 100%; padding: 16px; margin-top: 18px; font-size: 1.05rem; }
+#setup-status { margin-top: 12px; padding: 10px; border-radius: 8px; background: #222; font-size: .85rem; color: #ccc; min-height: 20px; }
+
+/* ---- Écran direct ---- */
+#live { position: fixed; inset: 0; background: #000; display: flex; flex-direction: column; }
+#local { flex: 1; width: 100%; min-height: 0; object-fit: contain; background: #000; }
+.live-status {
+  position: absolute; top: calc(8px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
+  max-width: calc(100% - 24px); padding: 6px 12px; border-radius: 999px;
+  background: rgba(0,0,0,.55); color: #eee; font-size: .8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.controls {
+  display: flex; gap: 12px; justify-content: center;
+  padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+  background: linear-gradient(transparent, rgba(0,0,0,.6));
+}
+.ctl {
+  flex: 1; max-width: 120px; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 12px 8px; border-radius: 14px; background: #2a2a2a; color: #fff;
+}
+.ctl .ico { font-size: 1.5rem; line-height: 1; }
+.ctl .lbl { font-size: .78rem; font-weight: 600; }
+.ctl.off { background: #6b1e1e; }        /* micro ou son coupé */
+.ctl.danger { background: #7a2020; }
+.ctl:active { filter: brightness(1.2); }
+
+/* En paysage, on resserre les contrôles sur un côté pour laisser voir l'image */
+@media (orientation: landscape) and (max-height: 480px) {
+  .controls { padding: 8px 12px; }
+  .ctl { padding: 8px 6px; max-width: 96px; }
+  .ctl .ico { font-size: 1.25rem; }
+}

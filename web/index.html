@@ -2,36 +2,57 @@
 <html lang="fr">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <title>Streame — caméra</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<h1>📱 Streame — caméra</h1>
-<label for="name">Nom</label>
-<input id="name" placeholder="iPhone de Valentin">
-<div class="row">
-  <div>
-    <label for="camera">Caméra</label>
-    <select id="camera">
-      <option value="environment">Arrière</option>
-      <option value="user">Avant</option>
-    </select>
+
+<!-- Écran de réglages, avant le démarrage du direct -->
+<section id="setup" class="screen">
+  <h1>📱 Streame</h1>
+
+  <div class="preview-wrap">
+    <video id="preview" autoplay muted playsinline></video>
+    <button id="enable" hidden>Toucher pour activer la caméra</button>
   </div>
-  <div>
-    <label for="quality">Qualité</label>
-    <select id="quality">
-      <option value="1080" selected>1080p</option>
-      <option value="720">720p</option>
-      <option value="480">480p</option>
-    </select>
+
+  <label for="name">Nom</label>
+  <input id="name" placeholder="iPhone de Valentin" autocomplete="off">
+
+  <label for="camera">Caméra</label>
+  <select id="camera">
+    <option value="environment">Arrière</option>
+    <option value="user">Avant</option>
+  </select>
+
+  <label for="mic">Source audio</label>
+  <select id="mic"><option value="">Micro par défaut</option></select>
+
+  <label for="quality">Qualité</label>
+  <select id="quality">
+    <option value="1080" selected>1080p</option>
+    <option value="720">720p</option>
+    <option value="480">480p</option>
+  </select>
+
+  <button id="start">Démarrer le direct</button>
+  <div id="setup-status">Prêt.</div>
+</section>
+
+<!-- Écran direct, une fois le stream lancé -->
+<section id="live" class="screen" hidden>
+  <video id="local" autoplay muted playsinline></video>
+  <div id="live-status" class="live-status">Connexion…</div>
+  <div class="controls">
+    <button id="mute" class="ctl"><span class="ico">🎙</span><span class="lbl">Micro</span></button>
+    <button id="spk" class="ctl"><span class="ico">🔊</span><span class="lbl">Son</span></button>
+    <button id="quit" class="ctl danger"><span class="ico">✕</span><span class="lbl">Quitter</span></button>
   </div>
-</div>
-<button id="connect">Connecter</button>
-<button id="mute" class="secondary" disabled>Couper le micro</button>
-<div id="status">Prêt.</div>
-<video id="local" autoplay muted playsinline></video>
+</section>
+
 <audio id="remote" autoplay playsinline></audio>
 <script src="/app.js"></script>
 </body>
