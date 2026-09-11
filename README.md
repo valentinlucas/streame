@@ -122,8 +122,8 @@ output_device = "WING"        # "default", "none" ou sous-chaîne du nom (voir `
 input_device = "WING"
 output_channels = 0                # 0 = auto (nombre max de canaux du périphérique)
 input_channels = 0
-branding_output_channels = [1]     # son de l'habillage → sortie 1 de la Wing
-stream_output_channels = [2]       # son du stream WebRTC → sortie 2 de la Wing
+branding_output_channels = [1, 2]  # habillage stéréo → sorties 1/2 de la Wing
+stream_output_channels = [3, 4]    # stream WebRTC stéréo → sorties 3/4 (ou [3] pour mono)
 return_from_input_channels = [1]   # entrée 1 de la Wing → retour du téléphone
 meters = true                      # VU-mètres dans le panneau de contrôle
 

@@ -32,8 +32,14 @@ output_device = "WING"
 input_device = "WING"
 output_channels = 0
 input_channels = 0
-stream_output_channels = [2]
-branding_output_channels = [1]
+stream_output_channels = [
+    3,
+    4,
+]
+branding_output_channels = [
+    1,
+    2,
+]
 return_from_input_channels = [1]
 sample_rate = 48000
 meters = true

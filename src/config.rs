@@ -149,8 +149,9 @@ impl Default for AudioConfig {
             input_device: "default".into(),
             output_channels: 0,
             input_channels: 0,
-            stream_output_channels: vec![2],
-            branding_output_channels: vec![1],
+            // Habillage stéréo → sorties 1/2 ; stream WebRTC stéréo → sorties 3/4.
+            stream_output_channels: vec![3, 4],
+            branding_output_channels: vec![1, 2],
             return_from_input_channels: vec![1],
             sample_rate: 48000,
             meters: true,
@@ -390,8 +391,8 @@ impl Config {
         let mut cfg = Config::default();
         cfg.audio.output_device = "WING".into();
         cfg.audio.input_device = "WING".into();
-        cfg.audio.branding_output_channels = vec![1]; // habillage → sortie 1
-        cfg.audio.stream_output_channels = vec![2]; // stream WebRTC → sortie 2
+        cfg.audio.branding_output_channels = vec![1, 2]; // habillage stéréo → sorties 1/2
+        cfg.audio.stream_output_channels = vec![3, 4]; // stream WebRTC stéréo → sorties 3/4
         cfg.audio.return_from_input_channels = vec![1]; // entrée 1 → retour téléphone
         cfg.output.display = "HDMI".into();
         cfg.scenes = vec![

@@ -883,6 +883,69 @@ impl Renderer {
                 1.0,
             ));
         }
+
+        // VU-mètres audio (coin bas-gauche)
+        let meters = engine.meters();
+        if !meters.is_empty() {
+            let mpx = (px * 0.85).max(11.0);
+            let pad = mpx * 0.5;
+            let row_h = mpx * 1.7;
+            let panel_w = (w as f32 * 0.26).clamp(200.0, 460.0);
+            let panel_h = row_h * meters.len() as f32 + pad;
+            let px0 = thick;
+            let py0 = h as f32 - panel_h - thick;
+            draws.push(Draw::solid(
+                [px0, py0, panel_w, panel_h],
+                [0.0, 0.0, 0.0, 0.55],
+            ));
+            let label_w = panel_w * 0.40;
+            let bar_x = px0 + label_w + pad;
+            let bar_w = panel_w - label_w - 2.0 * pad;
+            let frac = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+            for (i, m) in meters.iter().enumerate() {
+                let ry = py0 + pad * 0.5 + i as f32 * row_h;
+                let bar_h = mpx * 0.7;
+                let by = ry + (row_h - bar_h) / 2.0;
+
+                let short = match m.id.as_str() {
+                    "stream" => "Stream",
+                    "branding" => "Habillage",
+                    "return" => "Retour",
+                    _ => m.label.as_str(),
+                };
+                let k = self.label(short, mpx, [230, 230, 230, 255], None);
+                let (tw, th) = self.tex_size(k);
+                draws.push(Draw::tex(
+                    [px0 + pad, by + (bar_h - th) / 2.0, tw, th],
+                    k,
+                    1.0,
+                ));
+
+                draws.push(Draw::solid(
+                    [bar_x, by, bar_w, bar_h],
+                    [0.16, 0.16, 0.16, 1.0],
+                ));
+                let peak = m.peak_db.iter().copied().fold(-100.0f32, f32::max);
+                let rms = m.rms_db.iter().copied().fold(-100.0f32, f32::max);
+                let color = if peak > -3.0 {
+                    [0.88, 0.13, 0.13, 1.0]
+                } else if peak > -12.0 {
+                    [0.88, 0.75, 0.13, 1.0]
+                } else {
+                    [0.13, 0.75, 0.25, 1.0]
+                };
+                let fw = bar_w * frac(rms);
+                if fw > 0.5 {
+                    draws.push(Draw::solid([bar_x, by, fw, bar_h], color));
+                }
+                let peak_x = bar_x + bar_w * frac(peak);
+                draws.push(Draw::solid(
+                    [peak_x - 1.0, by, 2.0, bar_h],
+                    [1.0, 1.0, 1.0, 0.9],
+                ));
+            }
+        }
+
         self.encode_pass(
             &mut encoder,
             &view,
