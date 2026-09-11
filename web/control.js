@@ -1,6 +1,6 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  let ws, state = null, clickTimer = null;
+  let ws, state = null, clickTimer = null, meterEls = {};
 
   function connect() {
     ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/control');
@@ -9,9 +9,42 @@
     ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data);
       if (m.type === 'state') { state = m.state; render(); }
+      else if (m.type === 'meters') renderMeters(m.meters);
     };
   }
   const send = (m) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); };
+
+  // ---- VU-mètres : -60..0 dBFS mappés sur 0..100 % -------------------------------------
+  const dbToPct = (db) => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+  function renderMeters(meters) {
+    const box = $('meters');
+    for (const m of meters) {
+      let row = meterEls[m.id];
+      if (!row) {
+        row = document.createElement('div');
+        row.className = 'meter';
+        row.innerHTML = `<span class="mlabel">${m.label}</span><div class="mbars"></div>`;
+        box.appendChild(row);
+        meterEls[m.id] = row;
+      }
+      const bars = row.querySelector('.mbars');
+      const n = Math.max(1, (m.peak_db || []).length);
+      while (bars.children.length < n) {
+        const b = document.createElement('div');
+        b.className = 'mbar';
+        b.innerHTML = '<div class="mfill"></div><div class="mpeak"></div>';
+        bars.appendChild(b);
+      }
+      for (let c = 0; c < n; c++) {
+        const rms = (m.rms_db && m.rms_db[c] != null) ? m.rms_db[c] : -100;
+        const peak = (m.peak_db && m.peak_db[c] != null) ? m.peak_db[c] : -100;
+        const bar = bars.children[c];
+        bar.querySelector('.mfill').style.width = dbToPct(rms) + '%';
+        bar.querySelector('.mpeak').style.left = dbToPct(peak) + '%';
+        bar.classList.toggle('clip', peak > -1);
+      }
+    }
+  }
 
   function render() {
     if (!state) return;

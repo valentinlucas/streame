@@ -261,6 +261,8 @@ async fn handle_control(socket: WebSocket, state: Shared) {
     {
         return;
     }
+    // Envoi périodique des VU-mètres (~15 images/s), sans surcharger l'état.
+    let mut meter_tick = tokio::time::interval(std::time::Duration::from_millis(66));
     loop {
         tokio::select! {
             msg = stream.next() => {
@@ -280,6 +282,13 @@ async fn handle_control(socket: WebSocket, state: Shared) {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
+                }
+            }
+            _ = meter_tick.tick() => {
+                let meters = state.engine.meters();
+                if !meters.is_empty() {
+                    let json = serde_json::json!({ "type": "meters", "meters": meters }).to_string();
+                    if sink.send(Message::Text(json.into())).await.is_err() { break; }
                 }
             }
         }

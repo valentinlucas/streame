@@ -47,8 +47,9 @@ téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôl
 - **Audio multicanal** : deux sources mélangées vers la carte son sur des canaux distincts.
   Le son de l'habillage (vidéos d'overlay) et le son du stream WebRTC vont chacun sur les canaux
   choisis de la Wing (matrice `mix-matrix`), et l'entrée choisie est renvoyée au téléphone.
-- **VU-mètres** : le multiview affiche les niveaux (dBFS) de chaque source en temps réel
-  (élément `level`) : Stream, Habillage et Retour (l'audio renvoyé au téléphone).
+- **VU-mètres** : les niveaux (dBFS) de chaque source (Stream, Habillage, Retour vers le
+  téléphone) s'affichent en temps réel (élément `level`) à la fois dans le multiview et dans
+  le panneau `/control`.
 - **Sélection audio** : le panneau `/control` liste les périphériques détectés et permet de
   re-router les canaux de chaque source en direct (`GET /api/audio`).
 
