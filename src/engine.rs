@@ -814,7 +814,7 @@ impl Engine {
                     };
                     let sr = dev_rate as i32;
                     match audio::cpal_out::start(sel, ch as u16, sr as u32) {
-                        Ok(output) => {
+                        Ok((output, pusher)) => {
                             let caps = gst::Caps::builder("audio/x-raw")
                                 .field("format", "F32LE")
                                 .field("layout", "interleaved")
@@ -828,11 +828,9 @@ impl Engine {
                             let appsink = gst_app::AppSink::builder()
                                 .caps(&caps)
                                 .sync(false)
-                                .max_buffers(8)
+                                .max_buffers(4)
                                 .drop(true)
                                 .build();
-                            let ring = output.ring.clone();
-                            let max_samples = (sr as usize) * (ch as usize) / 5; // ~200 ms
                             appsink.set_callbacks(
                                 gst_app::AppSinkCallbacks::builder()
                                     .new_sample(move |s| {
@@ -842,7 +840,7 @@ impl Engine {
                                             if let Ok(map) = buf.map_readable() {
                                                 let f: &[f32] =
                                                     bytemuck::cast_slice(map.as_slice());
-                                                audio::cpal_out::push(&ring, f, max_samples);
+                                                pusher.push(f);
                                             }
                                         }
                                         Ok(gst::FlowSuccess::Ok)
