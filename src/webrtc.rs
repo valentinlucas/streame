@@ -208,6 +208,13 @@ impl PeerConnectionEventHandler for Handler {
         // Boucle de lecture RTP : les paquets sortent déjà ordonnés/lissés du jitter buffer.
         let media_owned = media.to_string();
         let encoding_owned = encoding.to_string();
+        // Paramètres fmtp (packetization-mode, profile-level-id, sprop-parameter-sets…) : sans
+        // eux, rtph264depay peut mal réassembler les paquets FU-A de l'iPhone. webrtcbin les
+        // fournissait dans les caps ; on les reconstitue depuis la ligne fmtp négociée.
+        let fmtp_owned = codec
+            .as_ref()
+            .map(|c| c.sdp_fmtp_line.clone())
+            .unwrap_or_default();
         let cancel = self.cancel.clone();
         // Piste conservée pour l'envoi périodique de PLI (vidéo) ; la boucle ci-dessous consomme `track`.
         let pli_track = if media == "video" {
@@ -217,37 +224,62 @@ impl PeerConnectionEventHandler for Handler {
         };
         tokio::spawn(async move {
             let mut caps_set = false;
+            let mut count: u64 = 0u64;
             loop {
                 let evt = tokio::select! {
                     _ = cancel.cancelled() => break,
                     evt = track.poll() => evt,
                 };
-                let Some(evt) = evt else { break };
+                let Some(evt) = evt else {
+                    info!("piste {media_owned} : flux terminé (poll → None)");
+                    break;
+                };
                 match evt {
                     TrackRemoteEvent::OnRtpPacket(pkt) => {
                         if !caps_set {
-                            let caps = gst::Caps::builder("application/x-rtp")
-                                .field("media", &media_owned)
-                                .field("encoding-name", &encoding_owned)
+                            let mut cb = gst::Caps::builder("application/x-rtp")
+                                .field("media", media_owned.as_str())
+                                .field("encoding-name", encoding_owned.as_str())
                                 .field("clock-rate", clock_rate as i32)
-                                .field("payload", pkt.header.payload_type as i32)
-                                .build();
+                                .field("payload", pkt.header.payload_type as i32);
+                            for kv in fmtp_owned.split(';') {
+                                if let Some((k, v)) = kv.split_once('=') {
+                                    let (k, v) = (k.trim(), v.trim());
+                                    if !k.is_empty() && !v.is_empty() {
+                                        cb = cb.field(k, v);
+                                    }
+                                }
+                            }
+                            let caps = cb.build();
                             appsrc.set_caps(Some(&caps));
                             caps_set = true;
+                            info!("piste {media_owned} : 1er paquet RTP (pt={}), caps appsrc = {caps}", pkt.header.payload_type);
                         }
                         let mut bytes = vec![0u8; pkt.marshal_size()];
                         match pkt.marshal_to(&mut bytes) {
                             Ok(n) => {
                                 bytes.truncate(n);
                                 let buf = gst::Buffer::from_mut_slice(bytes);
-                                if appsrc.push_buffer(buf).is_err() {
-                                    break;
+                                match appsrc.push_buffer(buf) {
+                                    Ok(_) => {
+                                        count += 1;
+                                        if count % 250 == 0 {
+                                            debug!("piste {media_owned} : {count} paquets RTP poussés");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("piste {media_owned} : push appsrc échoué ({e:?})");
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => warn!("RTP marshal : {e}"),
                         }
                     }
-                    TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => break,
+                    TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => {
+                        info!("piste {media_owned} : événement {evt:?}");
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -414,6 +446,11 @@ impl PhoneSession {
         // --- Statistiques RTP (toutes les secondes) -------------------------------------------
         spawn_stats(pc.clone(), engine.clone(), video_codec, cancel.clone());
 
+        // Surveillance des bus : sans elle, une erreur de decodebin (pas de décodeur, caps
+        // incompatibles, pads non liés) passe totalement inaperçue.
+        spawn_bus_watch(&decode_pipeline, format!("decode-{name}"));
+        spawn_bus_watch(&return_pipeline, format!("return-{name}"));
+
         decode_pipeline
             .set_state(gst::State::Playing)
             .context("démarrage du pipeline de décodage")?;
@@ -463,6 +500,13 @@ impl PhoneSession {
         self.cancel.cancel();
         let _ = self.decode_pipeline.set_state(gst::State::Null);
         let _ = self.return_pipeline.set_state(gst::State::Null);
+        // Débloque les threads de surveillance des bus (iter_timed).
+        if let Some(b) = self.decode_pipeline.bus() {
+            b.set_flushing(true);
+        }
+        if let Some(b) = self.return_pipeline.bus() {
+            b.set_flushing(true);
+        }
         // `close()` de la PeerConnection est asynchrone : on la lance sans l'attendre si un
         // runtime Tokio est disponible ; sinon le `Drop` de la PeerConnection fera le ménage.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -478,6 +522,32 @@ impl Drop for PhoneSession {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Journalise les erreurs/avertissements d'un pipeline GStreamer sur un thread dédié.
+fn spawn_bus_watch(pipeline: &gst::Pipeline, name: String) {
+    let Some(bus) = pipeline.bus() else { return };
+    let _ = std::thread::Builder::new()
+        .name(format!("bus-{name}"))
+        .spawn(move || {
+            for msg in bus.iter_timed(gst::ClockTime::NONE) {
+                use gst::MessageView;
+                match msg.view() {
+                    MessageView::Error(e) => {
+                        let src = e.src().map(|s| s.path_string().to_string()).unwrap_or_default();
+                        error!("pipeline {name} : {} [{src}] ({:?})", e.error(), e.debug());
+                    }
+                    MessageView::Warning(w) => {
+                        warn!("pipeline {name} : {} ({:?})", w.error(), w.debug());
+                    }
+                    MessageView::Eos(_) => {
+                        info!("pipeline {name} : fin de flux");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
 }
 
 /// `(media, encoding-name)` GStreamer pour un type MIME webrtc-rs (ex. « video/h264 »).
@@ -512,6 +582,7 @@ fn attach_decoded_branch(pipe: &gst::Pipeline, dpad: &gst::Pad, engine: &Arc<Eng
         return Ok(());
     };
     let media = s.name().to_string();
+    info!("decodebin : pad ajouté, caps décodées = {caps}");
     let q = gst::ElementFactory::make("queue")
         .property("max-size-buffers", 2u32)
         .property("max-size-time", 0u64)
