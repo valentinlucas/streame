@@ -286,21 +286,32 @@ impl PeerConnectionEventHandler for Handler {
             let _ = appsrc.end_of_stream();
         });
 
-        // Vidéo : demander une image-clé régulièrement (rétablissement après perte / au démarrage).
+        // Vidéo : demander une image-clé. On envoie un PLI tout de suite (le décodeur a besoin
+        // d'une image-clé + SPS/PPS pour démarrer), puis une petite rafale, puis un rythme lent.
+        // Sans cette rafale initiale, si la 1re image-clé arrive avant que decodebin ne soit prêt,
+        // rtph264depay attend la suivante et l'image met longtemps (ou ne vient pas) — d'où les
+        // démarrages « sans image » qu'on ne récupérait qu'en relançant le stream.
         if let Some(pli_track) = pli_track {
             let cancel = self.cancel.clone();
             tokio::spawn(async move {
+                let mut n = 0u32;
                 loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-                    }
                     let pli = PictureLossIndication {
                         sender_ssrc: 0,
                         media_ssrc,
                     };
                     if pli_track.write_rtcp(vec![Box::new(pli)]).await.is_err() {
                         break;
+                    }
+                    n += 1;
+                    let wait = if n < 6 {
+                        Duration::from_millis(400)
+                    } else {
+                        Duration::from_secs(3)
+                    };
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(wait) => {}
                     }
                 }
             });

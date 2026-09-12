@@ -293,13 +293,19 @@ pub mod cpal_out {
                 .ok_or_else(|| anyhow!("aucune sortie CoreAudio par défaut"));
         }
         let low = name.to_lowercase();
-        host.output_devices()?
-            .find(|d| {
-                d.name()
-                    .map(|n| n.to_lowercase().contains(&low))
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| anyhow!("périphérique de sortie CoreAudio « {name} » introuvable"))
+        if let Some(d) = host.output_devices()?.find(|d| {
+            d.name()
+                .map(|n| n.to_lowercase().contains(&low))
+                .unwrap_or(false)
+        }) {
+            return Ok(d);
+        }
+        // Périphérique nommé absent (ex. Wing débranchée) : repli sur la sortie par défaut
+        // plutôt que de désactiver tout l'audio — les VU-mètres et l'habillage continuent.
+        warn!("sortie CoreAudio « {name} » introuvable : repli sur la sortie par défaut");
+        host.default_output_device().ok_or_else(|| {
+            anyhow!("périphérique de sortie CoreAudio « {name} » introuvable et aucune sortie par défaut")
+        })
     }
 
     /// Meilleure configuration (nombre de canaux maximal, 48 kHz si possible).
@@ -484,13 +490,17 @@ pub mod cpal_out {
                 .ok_or_else(|| anyhow!("aucune entrée CoreAudio par défaut"));
         }
         let low = name.to_lowercase();
-        host.input_devices()?
-            .find(|d| {
-                d.name()
-                    .map(|n| n.to_lowercase().contains(&low))
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| anyhow!("périphérique d'entrée CoreAudio « {name} » introuvable"))
+        if let Some(d) = host.input_devices()?.find(|d| {
+            d.name()
+                .map(|n| n.to_lowercase().contains(&low))
+                .unwrap_or(false)
+        }) {
+            return Ok(d);
+        }
+        warn!("entrée CoreAudio « {name} » introuvable : repli sur l'entrée par défaut");
+        host.default_input_device().ok_or_else(|| {
+            anyhow!("périphérique d'entrée CoreAudio « {name} » introuvable et aucune entrée par défaut")
+        })
     }
 
     /// Meilleure configuration d'entrée (canaux max, 48 kHz si possible).
