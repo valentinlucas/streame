@@ -57,6 +57,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cpal = "0.15"
 # Tampon sans verrou entre GStreamer et le thread temps réel CoreAudio (évite les trous audio).
 ringbuf = "0.4"
+# Codec Opus directement en Rust (encode le retour, décode l'audio du téléphone) : plus de
+# GStreamer dans la chaîne audio, un seul saut cpal ↔ codec. Lie la libopus système (brew).
+opus = "0.3"
 # Nom réel des écrans (NSScreen.localizedName) ; mêmes versions que winit.
 objc2-app-kit = { version = "0.2.2", features = ["NSScreen"] }
 objc2-foundation = { version = "0.2.2", features = ["NSString"] }

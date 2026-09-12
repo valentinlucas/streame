@@ -145,6 +145,9 @@ struct AudioCtl {
     /// VU-mètres calculés dans les callbacks cpal (macOS).
     #[cfg(target_os = "macos")]
     meters_cpal: Option<Arc<audio::cpal_out::Meters>>,
+    /// Lecture du retour (entrée carte) pour l'encodage Opus direct côté webrtc-rs (macOS).
+    #[cfg(target_os = "macos")]
+    return_reader: Option<audio::cpal_out::Reader>,
     out_channels: i32,
     in_channels: i32,
 }
@@ -916,46 +919,18 @@ impl Engine {
                         meters_arc,
                     ) {
                         Ok((input, reader)) => {
-                            let caps = gst::Caps::builder("audio/x-raw")
-                                .field("format", "F32LE")
-                                .field("layout", "interleaved")
-                                .field("rate", rate)
-                                .field("channels", 2i32)
-                                .build();
-                            let appsrc = gst_app::AppSrc::builder()
-                                .caps(&caps)
-                                .is_live(true)
-                                .format(gst::Format::Time)
-                                .do_timestamp(true)
-                                .min_latency(0)
-                                .max_latency(80_000_000) // 80 ms
-                                .leaky_type(gst_app::AppLeakyType::Downstream)
-                                .max_time(gst::ClockTime::from_mseconds(80))
-                                .build();
-                            let chunk = (rate as usize / 100).max(1); // 10 ms de trames stéréo
-                            appsrc.set_callbacks(
-                                gst_app::AppSrcCallbacks::builder()
-                                    .need_data(move |src, _| {
-                                        let mut buf = vec![0f32; chunk * 2];
-                                        reader.pull(&mut buf); // le reste non fourni reste silence
-                                        let bytes: Vec<u8> = bytemuck::cast_slice(&buf).to_vec();
-                                        let _ = src.push_buffer(gst::Buffer::from_mut_slice(bytes));
-                                    })
-                                    .build(),
-                            );
-                            let level = level_element("level_return", a.meters)?;
-                            let sink = gst::ElementFactory::make("interaudiosink")
-                                .property("channel", RETURN_AUDIO_CHANNEL)
-                                .build()?;
-                            pipeline.add_many([appsrc.upcast_ref(), &level, &sink])?;
-                            link_many(&[appsrc.upcast_ref(), &level, &sink])?;
+                            // Le retour est encodé en Opus directement (libopus) côté webrtc-rs,
+                            // qui lira ce `reader` : plus de pont GStreamer (appsrc/interaudio) ni
+                            // d'encodeur GStreamer sur ce chemin. Le VU-mètre du retour est déjà
+                            // calculé dans le callback d'entrée cpal.
                             ctl.in_channels = in_ch as i32;
                             ctl.return_sel = Some(sel);
+                            ctl.return_reader = Some(reader);
                             route.in_channels = in_ch as i32;
                             keepalives.push(Box::new(input));
                             meters.push(("return".to_string(), "Retour Wing".to_string()));
                             info!(
-                                "audio retour « {sel_in} » via CoreAudio : {in_ch} canaux, entrées {:?}",
+                                "audio retour « {sel_in} » via CoreAudio : {in_ch} canaux, entrées {:?} (Opus direct)",
                                 a.return_from_input_channels
                             );
                             return_done = true;
@@ -1265,6 +1240,21 @@ impl Engine {
         if let Some(src) = &self.phone_audio_src {
             let _ = src.push_buffer(buffer);
         }
+    }
+
+    /// Injecte l'audio du téléphone déjà décodé (F32 stéréo 48 kHz) dans le mixeur cpal.
+    /// Utilisé quand le décodage Opus est fait par libopus (macOS), sans GStreamer.
+    #[cfg(target_os = "macos")]
+    pub fn push_phone_audio_f32(&self, samples: &[f32]) {
+        if let Some(p) = &self.audio_ctl.phone_pusher {
+            p.push(samples);
+        }
+    }
+
+    /// Lecteur du retour (entrée carte, F32 stéréo) pour l'encodage Opus côté webrtc-rs (macOS).
+    #[cfg(target_os = "macos")]
+    pub fn return_reader(&self) -> Option<audio::cpal_out::Reader> {
+        self.audio_ctl.return_reader.clone()
     }
 
     pub fn scenes(&self) -> Vec<SceneInfo> {

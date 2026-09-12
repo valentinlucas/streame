@@ -15,7 +15,7 @@
 //! désormais `async` (le signaling tourne déjà dans une tâche Tokio).
 
 use crate::config::Config;
-use crate::engine::{frame_appsink, Engine, PhoneStats, RtpStats, RETURN_AUDIO_CHANNEL};
+use crate::engine::{frame_appsink, Engine, PhoneStats, RtpStats};
 use anyhow::{Context, Result};
 use gst::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -111,8 +111,9 @@ pub struct PhoneSession {
     /// deux pistes partageant un seul pipeline se gênaient (l'autoplug de la 2e decodebin
     /// échouait par intermittence → image OU son manquant selon la piste arrivée en second).
     decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>>,
-    /// Pipeline du son de retour (carte → Opus → piste locale webrtc-rs).
-    return_pipeline: gst::Pipeline,
+    /// Pipeline GStreamer du son de retour (hors macOS uniquement ; sur macOS le retour est
+    /// encodé en Opus par libopus dans une tâche, sans pipeline).
+    return_pipeline: Option<gst::Pipeline>,
 }
 
 /// Gestionnaire d'événements de la `PeerConnection`.
@@ -174,6 +175,14 @@ impl PeerConnectionEventHandler for Handler {
             *self.video_codec.lock().unwrap() = encoding.to_string();
         }
         info!("piste {media}/{encoding} du téléphone (ssrc {media_ssrc}, {clock_rate} Hz)");
+
+        // Audio sur macOS : décodage Opus direct (libopus) → mixeur cpal, sans GStreamer.
+        // (La vidéo reste décodée par GStreamer/vtdec ; hors macOS, l'audio aussi.)
+        #[cfg(target_os = "macos")]
+        if media == "audio" {
+            spawn_opus_decode(track, self.engine.clone(), self.cancel.clone());
+            return;
+        }
 
         // Un pipeline dédié par piste (voir PhoneSession::decode_pipelines) : isolation totale,
         // pas d'interférence entre l'audio et la vidéo au démarrage.
@@ -421,9 +430,32 @@ impl PhoneSession {
         .await
         .context("transceiver vidéo")?;
 
-        // Pipeline du son de retour : carte → Opus → appsink → piste webrtc-rs.
-        let (return_pipeline, ret_rx) = build_return_pipeline(cfg).context("pipeline de retour")?;
-        spawn_return_writer(return_track, sender, ssrc, ret_rx, cancel.clone());
+        // Son de retour → téléphone. macOS : encodage Opus direct (libopus) depuis l'entrée
+        // carte (cpal), sans GStreamer. Ailleurs : pipeline GStreamer (interaudiosrc → opusenc).
+        #[cfg(target_os = "macos")]
+        let return_pipeline: Option<gst::Pipeline> = {
+            match engine.return_reader() {
+                Some(reader) => spawn_opus_return(
+                    reader,
+                    return_track,
+                    sender,
+                    ssrc,
+                    cfg.server.return_audio_bitrate,
+                    cancel.clone(),
+                ),
+                None => warn!("retour : entrée audio non initialisée, pas de son renvoyé"),
+            }
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let return_pipeline: Option<gst::Pipeline> = {
+            let (pipe, ret_rx) = build_return_pipeline(cfg).context("pipeline de retour")?;
+            spawn_return_writer(return_track, sender, ssrc, ret_rx, cancel.clone());
+            spawn_bus_watch(&pipe, format!("return-{name}"));
+            pipe.set_state(gst::State::Playing)
+                .context("démarrage du pipeline de retour")?;
+            Some(pipe)
+        };
 
         // --- Offre : create-offer → set-local → envoi au téléphone ---------------------------
         let offer = pc.create_offer(None).await.context("create-offer")?;
@@ -439,13 +471,6 @@ impl PhoneSession {
 
         // --- Statistiques RTP (toutes les secondes) -------------------------------------------
         spawn_stats(pc.clone(), engine.clone(), video_codec, cancel.clone());
-
-        // Surveillance du bus du retour (les pipelines de décodage sont surveillés à leur
-        // création dans build_decode_chain).
-        spawn_bus_watch(&return_pipeline, format!("return-{name}"));
-        return_pipeline
-            .set_state(gst::State::Playing)
-            .context("démarrage du pipeline de retour")?;
 
         info!("session WebRTC (webrtc-rs) démarrée pour « {name} »");
         Ok(Arc::new(PhoneSession {
@@ -493,9 +518,11 @@ impl PhoneSession {
                 b.set_flushing(true); // débloque le thread de surveillance (iter_timed)
             }
         }
-        let _ = self.return_pipeline.set_state(gst::State::Null);
-        if let Some(b) = self.return_pipeline.bus() {
-            b.set_flushing(true);
+        if let Some(rp) = &self.return_pipeline {
+            let _ = rp.set_state(gst::State::Null);
+            if let Some(b) = rp.bus() {
+                b.set_flushing(true);
+            }
         }
         // `close()` de la PeerConnection est asynchrone : on la lance sans l'attendre si un
         // runtime Tokio est disponible ; sinon le `Drop` de la PeerConnection fera le ménage.
@@ -664,12 +691,13 @@ fn attach_decoded_branch(pipe: &gst::Pipeline, dpad: &gst::Pad, engine: &Arc<Eng
     Ok(())
 }
 
-/// Pipeline du son de retour : `interaudiosrc` (alimenté par cpal) → Opus → `appsink`.
-/// Renvoie le pipeline et le récepteur des trames Opus (données + durée).
+/// Pipeline du son de retour (repli hors macOS) : `interaudiosrc` (alimenté par cpal) → Opus →
+/// `appsink`. Renvoie le pipeline et le récepteur des trames Opus (données + durée).
+#[cfg(not(target_os = "macos"))]
 fn build_return_pipeline(cfg: &Config) -> Result<(gst::Pipeline, mpsc::UnboundedReceiver<(bytes::Bytes, Duration)>)> {
     let pipeline = gst::Pipeline::with_name("phone-return");
     let src = gst::ElementFactory::make("interaudiosrc")
-        .property("channel", RETURN_AUDIO_CHANNEL)
+        .property("channel", crate::engine::RETURN_AUDIO_CHANNEL)
         .build()?;
     let convert = gst::ElementFactory::make("audioconvert").build()?;
     let resample = gst::ElementFactory::make("audioresample").build()?;
@@ -719,7 +747,9 @@ fn build_return_pipeline(cfg: &Config) -> Result<(gst::Pipeline, mpsc::Unbounded
     Ok((pipeline, rx))
 }
 
-/// Écrit les trames Opus de retour sur la piste locale une fois le type de charge utile négocié.
+/// Écrit les trames Opus de retour sur la piste locale une fois le type de charge utile négocié
+/// (repli hors macOS ; sur macOS l'encodage est fait directement par [`spawn_opus_return`]).
+#[cfg(not(target_os = "macos"))]
 fn spawn_return_writer(
     track: Arc<TrackLocalStaticSample>,
     sender: Arc<dyn RtpSender>,
@@ -769,6 +799,129 @@ fn spawn_return_writer(
                 .is_err()
             {
                 break;
+            }
+        }
+    });
+}
+
+/// Attend que le type de charge utile de l'émetteur soit négocié (après la réponse SDP).
+#[cfg(target_os = "macos")]
+async fn resolve_payload_type(
+    sender: &Arc<dyn RtpSender>,
+    cancel: &CancellationToken,
+) -> Option<u8> {
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if let Ok(params) = sender.get_parameters().await {
+            if let Some(codec) = params.rtp_parameters.codecs.first() {
+                return Some(codec.payload_type);
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return None,
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+        }
+    }
+}
+
+/// macOS : décode l'audio Opus entrant du téléphone avec libopus et le pousse dans le mixeur
+/// cpal (F32 stéréo 48 kHz). Les paquets sortent déjà ordonnés du jitter buffer webrtc-rs ;
+/// un paquet RTP Opus = une trame Opus (RFC 7587), donc pas de réassemblage.
+#[cfg(target_os = "macos")]
+fn spawn_opus_decode(track: Arc<dyn TrackRemote>, engine: Arc<Engine>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut dec = match opus::Decoder::new(48000, opus::Channels::Stereo) {
+            Ok(d) => d,
+            Err(e) => {
+                error!("décodeur Opus : {e}");
+                return;
+            }
+        };
+        let mut pcm = vec![0f32; 5760 * 2]; // jusqu'à 120 ms stéréo @ 48 kHz
+        let mut started = false;
+        loop {
+            let evt = tokio::select! {
+                _ = cancel.cancelled() => break,
+                evt = track.poll() => evt,
+            };
+            let Some(evt) = evt else { break };
+            match evt {
+                TrackRemoteEvent::OnRtpPacket(pkt) => {
+                    match dec.decode_float(pkt.payload.as_ref(), &mut pcm, false) {
+                        Ok(per_ch) => {
+                            engine.push_phone_audio_f32(&pcm[..per_ch * 2]);
+                            if !started {
+                                info!("audio téléphone : décodage Opus (libopus) démarré");
+                                started = true;
+                            }
+                        }
+                        Err(e) => warn!("décodage Opus : {e}"),
+                    }
+                }
+                TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => break,
+                _ => {}
+            }
+        }
+    });
+}
+
+/// macOS : encode le retour de la carte (entrée cpal, F32 stéréo 48 kHz) en Opus avec libopus
+/// et l'écrit sur la piste locale webrtc-rs, sans GStreamer. Cadence 20 ms.
+#[cfg(target_os = "macos")]
+fn spawn_opus_return(
+    reader: crate::audio::cpal_out::Reader,
+    track: Arc<TrackLocalStaticSample>,
+    sender: Arc<dyn RtpSender>,
+    ssrc: u32,
+    bitrate: i32,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let Some(pt) = resolve_payload_type(&sender, &cancel).await else {
+            return;
+        };
+        let mut enc =
+            match opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Voip) {
+                Ok(e) => e,
+                Err(e) => {
+                    error!("encodeur Opus : {e}");
+                    return;
+                }
+            };
+        let _ = enc.set_bitrate(opus::Bitrate::Bits(bitrate));
+        let frame = 960 * 2; // 20 ms stéréo @ 48 kHz
+        let mut pcm = vec![0f32; frame];
+        let mut out = vec![0u8; 4000];
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        info!("retour audio : encodage Opus (libopus) démarré");
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => {}
+            }
+            pcm.iter_mut().for_each(|s| *s = 0.0);
+            reader.pull(&mut pcm); // pré-tamponné ; complète en silence si sous-alimenté
+            match enc.encode_float(&pcm, &mut out) {
+                Ok(len) if len > 0 => {
+                    let sample = Sample {
+                        data: bytes::Bytes::copy_from_slice(&out[..len]),
+                        duration: Duration::from_millis(20),
+                        ..Sample::new(Instant::now())
+                    };
+                    if track
+                        .sample_writer(ssrc, pt)
+                        .write_sample(&sample)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!("encodage Opus retour : {e}"),
             }
         }
     });
