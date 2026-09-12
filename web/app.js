@@ -197,9 +197,23 @@
   }
 
   async function onOffer(sdp) {
+    // Ré-offre du Mac (redémarrage ICE après un échec) : on garde la même RTCPeerConnection,
+    // ses pistes, son DTLS et les décodeurs côté Mac — coupure bien plus courte qu'une
+    // reconnexion complète.
+    if (pc && pc.remoteDescription && pc.signalingState === 'stable' && pc.connectionState !== 'closed') {
+      try {
+        await pc.setRemoteDescription({ type: 'offer', sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ type: 'answer', sdp: answer.sdp });
+        liveStatus('Redémarrage ICE…');
+        return;
+      } catch (e) { console.warn('[streame] ré-offre impossible, reconnexion complète', e); }
+    }
     if (pc) pc.close();
     pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     window.streamePc = pc; // pour le débogage
+    pc.oniceconnectionstatechange = () => console.log('[streame] ICE :', pc.iceConnectionState);
     pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'ice', candidate: e.candidate.candidate, sdpMLineIndex: e.candidate.sdpMLineIndex }); };
     pc.ontrack = (e) => { if (e.track.kind === 'audio') { $('remote').srcObject = e.streams[0] || new MediaStream([e.track]); if (spkOn) $('remote').play().catch(() => {}); } };
     pc.onconnectionstatechange = () => {

@@ -25,6 +25,28 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub engine: Arc<Engine>,
     pub phone: Mutex<Option<Arc<PhoneSession>>>,
+    /// Runtime dédié au média : les sessions WebRTC y sont lancées, à l'écart du serveur.
+    pub media: tokio::runtime::Handle,
+}
+
+/// Chien de garde d'un runtime Tokio : mesure le retard d'un réveil périodique. Un retard
+/// important signale des workers bloqués (appel bloquant, verrou tenu trop longtemps) — la
+/// cause classique d'un serveur qui « ne répond plus » et d'un ICE qui décroche.
+pub fn spawn_lag_watchdog(handle: &tokio::runtime::Handle, name: &'static str) {
+    handle.spawn(async move {
+        let period = std::time::Duration::from_millis(500);
+        loop {
+            let t0 = std::time::Instant::now();
+            tokio::time::sleep(period).await;
+            let lag = t0.elapsed().saturating_sub(period);
+            if lag > std::time::Duration::from_millis(250) {
+                warn!(
+                    "runtime {name} : réveil en retard de {} ms (workers bloqués ?)",
+                    lag.as_millis()
+                );
+            }
+        }
+    });
 }
 
 pub type Shared = Arc<AppState>;
@@ -89,6 +111,7 @@ pub async fn run(state: Shared, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Result<(
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem)
         .await
         .context("configuration TLS")?;
+    spawn_lag_watchdog(&tokio::runtime::Handle::current(), "serveur");
     info!("serveur HTTPS sur https://{addr}");
     axum_server::bind_rustls(addr, tls)
         .serve(app.into_make_service())
@@ -121,13 +144,17 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
     let mut session: Option<Arc<PhoneSession>> = None;
     let mut events = state.engine.subscribe();
+    // Ping toutes les 15 s : garde la connexion vivante à travers les boîtiers qui coupent les
+    // WebSocket inactifs, et détecte vite un téléphone parti (le navigateur répond en pong).
+    let mut ping_tick = tokio::time::interval(std::time::Duration::from_secs(15));
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             msg = stream.next() => {
                 let text = match msg {
                     Some(Ok(Message::Text(t))) => t.to_string(),
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => { info!("websocket téléphone fermé côté téléphone"); break; }
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => { warn!("websocket téléphone : {e}"); break; }
                 };
@@ -143,15 +170,24 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
                             info!("téléphone « {} » remplacé par « {name} »", old.name);
                             old.close();
                         }
-                        match PhoneSession::start(&state.cfg, name, tx.clone(), state.engine.clone()).await {
-                            Ok(s) => {
+                        // La session (WebRTC, décodage, audio) vit sur le runtime média, pas ici.
+                        let started = state
+                            .media
+                            .spawn(PhoneSession::start(state.cfg.clone(), name, tx.clone(), state.engine.clone()))
+                            .await;
+                        match started {
+                            Ok(Ok(s)) => {
                                 *state.phone.lock().unwrap() = Some(s.clone());
                                 session = Some(s);
                                 let _ = tx.send(ServerMsg::OnAir { on: state.engine.phone_on_air() });
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!("session WebRTC : {e:#}");
                                 let _ = tx.send(ServerMsg::Error { message: format!("{e:#}") });
+                            }
+                            Err(e) => {
+                                warn!("tâche de session WebRTC : {e}");
+                                let _ = tx.send(ServerMsg::Error { message: "session impossible".into() });
                             }
                         }
                     }
@@ -172,8 +208,11 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
                             s.set_phone_stats(&state.engine, st);
                         }
                     }
-                    ClientMsg::Bye => break,
+                    ClientMsg::Bye => { info!("téléphone : « bye »"); break; }
                 }
+            }
+            _ = ping_tick.tick() => {
+                if sink.send(Message::Ping(axum::body::Bytes::new())).await.is_err() { break; }
             }
             out = rx.recv() => {
                 match out {
@@ -207,6 +246,7 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
                     None => std::future::pending::<()>().await,
                 }
             } => {
+                info!("session WebRTC annulée (échec ICE non récupéré ou fermeture) : bye au téléphone");
                 let _ = sink.send(Message::Text(serde_json::to_string(&ServerMsg::Bye { reason: "session terminée".into() }).unwrap().into())).await;
                 break;
             }
@@ -268,8 +308,12 @@ async fn handle_control(socket: WebSocket, state: Shared) {
     }
     // Envoi périodique des VU-mètres (~15 images/s), sans surcharger l'état.
     let mut meter_tick = tokio::time::interval(std::time::Duration::from_millis(66));
+    let mut ping_tick = tokio::time::interval(std::time::Duration::from_secs(15));
     loop {
         tokio::select! {
+            _ = ping_tick.tick() => {
+                if sink.send(Message::Ping(axum::body::Bytes::new())).await.is_err() { break; }
+            }
             msg = stream.next() => {
                 let text = match msg {
                     Some(Ok(Message::Text(t))) => t.to_string(),

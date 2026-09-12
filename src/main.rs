@@ -98,10 +98,21 @@ fn main() -> Result<()> {
     let engine = engine::Engine::new(cfg.clone())?;
 
     // Serveur HTTPS + signaling dans un runtime tokio sur un thread dédié.
+    // Runtime Tokio dédié au média (WebRTC, boucles RTP, Opus, décodage) : isolé du serveur
+    // HTTP/WS pour qu'un blocage ou une charge média ne rende jamais la page ni le signaling
+    // inaccessibles — et inversement.
+    let media_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("media")
+        .enable_all()
+        .build()
+        .context("runtime média")?;
+    server::spawn_lag_watchdog(media_rt.handle(), "média");
     let state = Arc::new(server::AppState {
         cfg: cfg.clone(),
         engine: engine.clone(),
         phone: std::sync::Mutex::new(None),
+        media: media_rt.handle().clone(),
     });
     let server_thread = {
         let state = state.clone();

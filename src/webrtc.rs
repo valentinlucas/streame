@@ -19,7 +19,7 @@ use crate::engine::{frame_appsink, Engine, PhoneStats, RtpStats};
 use anyhow::{Context, Result};
 use gst::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -30,6 +30,7 @@ use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::{JitterBufferBuilder, Registry, Slot};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
+use rtc::peer_connection::configuration::RTCOfferOptions;
 use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9,
 };
@@ -47,7 +48,8 @@ use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer,
-    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, SettingEngineBuilder,
+    RTCIceConnectionState, RTCPeerConnectionIceErrorEvent, RTCPeerConnectionIceEvent,
+    RTCPeerConnectionState, RTCSessionDescription, RTCSignalingState, SettingEngineBuilder,
 };
 use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::{default_runtime, Runtime};
@@ -111,6 +113,11 @@ pub struct PhoneSession {
     pub name: String,
     pub cancel: CancellationToken,
     pc: Arc<dyn PeerConnection>,
+    /// Runtime média sur lequel la session a été créée (pour fermer la PeerConnection depuis
+    /// n'importe quel thread, y compris un `Drop`).
+    rt: tokio::runtime::Handle,
+    /// `close()` ne s'exécute qu'une fois (appelé explicitement puis par `Drop`).
+    closed: AtomicBool,
     /// Un pipeline de décodage **par piste entrante** (audio, vidéo). Chaque piste est isolée :
     /// deux pistes partageant un seul pipeline se gênaient (l'autoplug de la 2e decodebin
     /// échouait par intermittence → image OU son manquant selon la piste arrivée en second).
@@ -128,6 +135,13 @@ struct Handler {
     decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>>,
     cancel: CancellationToken,
     name: String,
+    /// La PeerConnection elle-même (renseignée après construction) : nécessaire pour relancer
+    /// l'ICE depuis le gestionnaire d'événements.
+    pc: Arc<StdMutex<Option<Arc<dyn PeerConnection>>>>,
+    /// Nombre de redémarrages ICE tentés sur cette session.
+    ice_restarts: Arc<AtomicU32>,
+    /// Vrai tant que la connexion est établie (pour le délai de grâce du redémarrage ICE).
+    connected: Arc<AtomicBool>,
     /// Codec vidéo réellement négocié (rempli à l'arrivée de la piste), pour l'affichage /control.
     video_codec: Arc<StdMutex<String>>,
     /// Retard appliqué à la vidéo pour l'aligner sur l'audio (lip-sync), en ms.
@@ -153,13 +167,40 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         info!("téléphone « {} » : état WebRTC {state:?}", self.name);
         match state {
-            RTCPeerConnectionState::Connected => self.engine.set_phone(Some(self.name.clone())),
-            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+            RTCPeerConnectionState::Connected => {
+                self.connected.store(true, Ordering::Relaxed);
+                self.engine.set_phone(Some(self.name.clone()));
+            }
+            RTCPeerConnectionState::Disconnected => {
+                // Transitoire (perte de paquets, changement de point d'accès) : l'ICE peut se
+                // rétablir seul ; on ne coupe rien, on note l'heure pour le diagnostic.
+                self.connected.store(false, Ordering::Relaxed);
+                warn!("téléphone « {} » : ICE momentanément déconnecté", self.name);
+            }
+            RTCPeerConnectionState::Failed => {
+                self.connected.store(false, Ordering::Relaxed);
+                self.engine.set_phone(None);
+                self.ice_restart();
+            }
+            RTCPeerConnectionState::Closed => {
+                self.connected.store(false, Ordering::Relaxed);
                 self.engine.set_phone(None);
                 self.cancel.cancel();
             }
             _ => {}
         }
+    }
+
+    async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
+        info!("téléphone « {} » : état ICE {state:?}", self.name);
+    }
+
+    async fn on_ice_candidate_error(&self, event: RTCPeerConnectionIceErrorEvent) {
+        warn!("téléphone « {} » : erreur de candidat ICE : {event:?}", self.name);
+    }
+
+    async fn on_signaling_state_change(&self, state: RTCSignalingState) {
+        debug!("téléphone « {} » : état signaling {state:?}", self.name);
     }
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
@@ -347,9 +388,74 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
+impl Handler {
+    /// Échec ICE : au lieu de détruire la session (et de laisser la page tout renégocier après
+    /// 2 s), on relance l'ICE avec de nouveaux identifiants (nouvelle offre `ice_restart`) —
+    /// les pistes, le DTLS et les décodeurs sont conservés, la coupure est bien plus courte.
+    /// Deux tentatives au plus, avec un délai de grâce de 15 s chacune ; ensuite on ferme et la
+    /// page se reconnecte.
+    fn ice_restart(&self) {
+        let n = self.ice_restarts.fetch_add(1, Ordering::Relaxed) + 1;
+        let Some(pc) = self.pc.lock().unwrap().clone() else {
+            self.cancel.cancel();
+            return;
+        };
+        if n > 2 {
+            warn!("téléphone « {} » : ICE en échec après {} redémarrages, session fermée", self.name, n - 1);
+            self.cancel.cancel();
+            return;
+        }
+        warn!("téléphone « {} » : ICE en échec, redémarrage ICE ({n}/2)", self.name);
+        let out = self.out.clone();
+        let cancel = self.cancel.clone();
+        let connected = self.connected.clone();
+        let engine = self.engine.clone();
+        let name = self.name.clone();
+        // Hors du callback (le pilote de la connexion nous appelle) : dans une tâche.
+        tokio::spawn(async move {
+            let opts = RTCOfferOptions {
+                ice_restart: true,
+                ..Default::default()
+            };
+            let offer = match pc.create_offer(Some(opts)).await {
+                Ok(o) => o,
+                Err(e) => {
+                    error!("redémarrage ICE : create-offer : {e}");
+                    cancel.cancel();
+                    return;
+                }
+            };
+            if let Err(e) = pc.set_local_description(offer).await {
+                error!("redémarrage ICE : set-local-description : {e}");
+                cancel.cancel();
+                return;
+            }
+            match pc.local_description().await {
+                Some(local) => {
+                    let _ = out.send(ServerMsg::Offer { sdp: local.sdp });
+                }
+                None => {
+                    cancel.cancel();
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    if !connected.load(Ordering::Relaxed) {
+                        warn!("téléphone « {name} » : pas reconnecté 15 s après le redémarrage ICE, session fermée");
+                        engine.set_phone(None);
+                        cancel.cancel();
+                    }
+                }
+            }
+        });
+    }
+}
+
 impl PhoneSession {
     pub async fn start(
-        cfg: &Config,
+        cfg: Arc<Config>,
         name: String,
         out: mpsc::UnboundedSender<ServerMsg>,
         engine: Arc<Engine>,
@@ -396,12 +502,16 @@ impl PhoneSession {
         // --- Gestionnaire d'événements --------------------------------------------------------
         let decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>> = Arc::new(StdMutex::new(Vec::new()));
         let video_codec = Arc::new(StdMutex::new(cfg.server.video_codec.to_uppercase()));
+        let pc_slot: Arc<StdMutex<Option<Arc<dyn PeerConnection>>>> = Arc::new(StdMutex::new(None));
         let handler = Arc::new(Handler {
             engine: engine.clone(),
             out: out.clone(),
             decode_pipelines: decode_pipelines.clone(),
             cancel: cancel.clone(),
             name: name.clone(),
+            pc: pc_slot.clone(),
+            ice_restarts: Arc::new(AtomicU32::new(0)),
+            connected: Arc::new(AtomicBool::new(false)),
             video_codec: video_codec.clone(),
             av_offset_ms: cfg.video.av_offset_ms,
             keyframe_interval_s: cfg.server.keyframe_interval_s,
@@ -421,6 +531,7 @@ impl PhoneSession {
             .await
             .context("construction de la PeerConnection")?;
         let pc: Arc<dyn PeerConnection> = Arc::new(pc);
+        *pc_slot.lock().unwrap() = Some(pc.clone());
 
         // --- Audio retour : piste locale Opus (envoyée vers le téléphone) ---------------------
         let ssrc = rand::random::<u32>();
@@ -495,7 +606,7 @@ impl PhoneSession {
         };
         #[cfg(not(target_os = "macos"))]
         let return_pipeline: Option<gst::Pipeline> = {
-            let (pipe, ret_rx) = build_return_pipeline(cfg).context("pipeline de retour")?;
+            let (pipe, ret_rx) = build_return_pipeline(&cfg).context("pipeline de retour")?;
             spawn_return_writer(return_track, sender, ssrc, ret_rx, cancel.clone());
             spawn_bus_watch(&pipe, format!("return-{name}"));
             pipe.set_state(gst::State::Playing)
@@ -523,6 +634,8 @@ impl PhoneSession {
             name,
             cancel,
             pc,
+            rt: tokio::runtime::Handle::current(),
+            closed: AtomicBool::new(false),
             decode_pipelines,
             return_pipeline,
         }))
@@ -556,28 +669,35 @@ impl PhoneSession {
         }
     }
 
+    /// Ferme la session. Idempotent et **non bloquant** : les arrêts GStreamer (`set_state(Null)`
+    /// attend la fin des threads de flux, parfois des centaines de ms avec VideoToolbox) sont
+    /// faits sur un thread dédié, jamais sur un worker Tokio — un worker bloqué, c'est un
+    /// serveur qui ne répond plus. La PeerConnection est fermée sur le runtime média.
     pub fn close(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.cancel.cancel();
-        for pipe in self.decode_pipelines.lock().unwrap().iter() {
-            let _ = pipe.set_state(gst::State::Null);
-            if let Some(b) = pipe.bus() {
-                b.set_flushing(true); // débloque le thread de surveillance (iter_timed)
-            }
-        }
+        let mut pipes: Vec<gst::Pipeline> = self.decode_pipelines.lock().unwrap().clone();
         if let Some(rp) = &self.return_pipeline {
-            let _ = rp.set_state(gst::State::Null);
-            if let Some(b) = rp.bus() {
-                b.set_flushing(true);
-            }
+            pipes.push(rp.clone());
         }
-        // `close()` de la PeerConnection est asynchrone : on la lance sans l'attendre si un
-        // runtime Tokio est disponible ; sinon le `Drop` de la PeerConnection fera le ménage.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let pc = self.pc.clone();
-            handle.spawn(async move {
-                let _ = pc.close().await;
+        let name = self.name.clone();
+        let _ = std::thread::Builder::new()
+            .name("gst-teardown".into())
+            .spawn(move || {
+                for pipe in &pipes {
+                    if let Some(b) = pipe.bus() {
+                        b.set_flushing(true); // débloque le thread de surveillance (iter_timed)
+                    }
+                    let _ = pipe.set_state(gst::State::Null);
+                }
+                debug!("session « {name} » : {} pipeline(s) GStreamer arrêté(s)", pipes.len());
             });
-        }
+        let pc = self.pc.clone();
+        self.rt.spawn(async move {
+            let _ = pc.close().await;
+        });
     }
 }
 
