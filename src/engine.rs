@@ -35,7 +35,7 @@ use tracing::{debug, error, info, warn};
 /// Canaux audio inter-pipelines (partagés avec le pipeline WebRTC).
 pub const RETURN_AUDIO_CHANNEL: &str = "streame-return-audio";
 
-pub const NO_PHONE_TEXT: &str = "EN ATTENTE DU TÉLÉPHONE";
+pub const NO_PHONE_TEXT: &str = "Connexion avec notre correspondant perdue !";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
