@@ -173,37 +173,17 @@ impl PeerConnectionEventHandler for Handler {
         }
         info!("piste {media}/{encoding} du téléphone (ssrc {media_ssrc}, {clock_rate} Hz)");
 
-        // appsrc RTP → decodebin (dépayloadage + décodage matériel), branché au moteur.
-        let appsrc = gst_app::AppSrc::builder()
-            .is_live(true)
-            .format(gst::Format::Time)
-            .do_timestamp(true)
-            .build();
-        let decode = match gst::ElementFactory::make("decodebin").build() {
-            Ok(d) => d,
+        // Chaîne de décodage explicite (dépay + décodeur câblés à l'avance) plutôt que
+        // decodebin : l'autoplug de decodebin depuis application/x-rtp est asynchrone et laissait
+        // tomber la 1re image-clé sur la 1re connexion (image absente tant qu'une autre image-clé
+        // n'arrivait pas → « ça revient en relançant »). Ici tout est lié avant le 1er paquet.
+        let appsrc = match build_decode_chain(&self.decode_pipeline, media, encoding, &self.engine) {
+            Ok(a) => a,
             Err(e) => {
-                error!("decodebin indisponible : {e}");
+                error!("mise en place du décodage {media}/{encoding} : {e:#}");
                 return;
             }
         };
-        let appsrc_el: gst::Element = appsrc.clone().upcast();
-        if let Err(e) = (|| -> Result<()> {
-            self.decode_pipeline.add_many([&appsrc_el, &decode])?;
-            appsrc_el.link(&decode)?;
-            let engine = self.engine.clone();
-            let pipe = self.decode_pipeline.clone();
-            decode.connect_pad_added(move |_, dpad| {
-                if let Err(e) = attach_decoded_branch(&pipe, dpad, &engine) {
-                    error!("branche de décodage : {e:#}");
-                }
-            });
-            appsrc_el.sync_state_with_parent()?;
-            decode.sync_state_with_parent()?;
-            Ok(())
-        })() {
-            error!("mise en place du décodage : {e:#}");
-            return;
-        }
 
         // Boucle de lecture RTP : les paquets sortent déjà ordonnés/lissés du jitter buffer.
         let media_owned = media.to_string();
@@ -584,7 +564,38 @@ fn rtp_media_encoding(kind: RtpCodecKind, mime: &str) -> (&'static str, &'static
     }
 }
 
-/// Construit la branche de décodage à partir d'un pad `decodebin` (vidéo → GPU, audio → moteur).
+/// Construit la chaîne de décodage : `appsrc(application/x-rtp) → decodebin`. decodebin
+/// auto-branche le dépayloadeur + le décodeur (matériel via vtdec) selon les caps, et
+/// `attach_decoded_branch` relie la sortie décodée au moteur (GPU pour la vidéo, cpal pour
+/// l'audio). Les caps de l'appsrc sont posées au 1er paquet dans la boucle de lecture.
+fn build_decode_chain(
+    pipe: &gst::Pipeline,
+    _media: &str,
+    _encoding: &str,
+    engine: &Arc<Engine>,
+) -> Result<gst_app::AppSrc> {
+    let appsrc = gst_app::AppSrc::builder()
+        .is_live(true)
+        .format(gst::Format::Time)
+        .do_timestamp(true)
+        .build();
+    let src: gst::Element = appsrc.clone().upcast();
+    let decode = gst::ElementFactory::make("decodebin").build()?;
+    pipe.add_many([&src, &decode])?;
+    src.link(&decode)?;
+    let engine = engine.clone();
+    let pipe2 = pipe.clone();
+    decode.connect_pad_added(move |_, dpad| {
+        if let Err(e) = attach_decoded_branch(&pipe2, dpad, &engine) {
+            error!("branche de décodage : {e:#}");
+        }
+    });
+    src.sync_state_with_parent()?;
+    decode.sync_state_with_parent()?;
+    Ok(appsrc)
+}
+
+/// Construit la branche de décodage à partir d'un pad `decodebin` (repli codec inconnu).
 fn attach_decoded_branch(pipe: &gst::Pipeline, dpad: &gst::Pad, engine: &Arc<Engine>) -> Result<()> {
     let Some(caps) = dpad.current_caps() else {
         return Ok(());

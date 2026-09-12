@@ -3,3 +3,8 @@
 *.pem
 /streame.toml
 !/streame.example.toml
+
+# Outils de dev (scripts/) : dépendances npm locales
+/scripts/node_modules
+/scripts/package.json
+/scripts/package-lock.json
