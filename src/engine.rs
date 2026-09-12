@@ -8,12 +8,15 @@
 //! pipeline WebRTC ─ vtdec ─ appsink ─► FrameSlot(phone) ─┐
 //! uridecodebin (overlay.mp4) ─ appsink ─► FrameSlot(vidéo) ─┼─► rendu wgpu/Metal ─► HDMI + multiview
 //! PNG / texte (décodés au démarrage) ────────────────────────┘
-//! pipeline WebRTC ─ décode audio ─ appsink ─► appsrc(leaky) ─ mix-matrix ─┐
-//! habillage (vidéos) ─ mix-matrix ─────────────────────────────────────────┼─► audiomixer ─► appsink ─► CoreAudio out (Wing)
-//! CoreAudio in (Wing) ─► appsrc ─► interaudiosink(return) ─► pipeline WebRTC ─► opus ─► téléphone
+//! pipeline WebRTC ─ décode audio ─ appsink ─► anneau stream ─┐
+//! habillage (vidéos) ─ audiomixer ─ appsink ─► anneau habillage ─┼─► callback CoreAudio (macOS) :
+//!                                                                 │   mixage + routage + VU-mètres
+//!                                                                 └─► carte (Wing), N canaux
+//! CoreAudio in (Wing) ─ callback (sélection canaux + VU) ─► anneau ─► appsrc ─► interaudiosink ─► WebRTC ─► opus ─► téléphone
 //! ```
-//! Toute l'E/S de la carte passe par CoreAudio (cpal) : GStreamer ne touche plus le
-//! périphérique, ce qui évite le conflit à deux frameworks qui coinçait la Wing.
+//! Sur macOS, tout le traitement carte (mixage, routage, mètres, E/S) se fait dans les callbacks
+//! CoreAudio (cpal), à l'horloge de la carte : une seule horloge, GStreamer ne touche plus le
+//! périphérique (fini le conflit à deux frameworks). Hors macOS, GStreamer fait le mixage et l'E/S.
 
 use crate::audio;
 use crate::config::{parse_color, Config, Geometry, LayerConfig};
@@ -133,6 +136,15 @@ struct AudioCtl {
     return_conv: Option<gst::Element>,
     /// Sélection des 2 canaux de retour quand l'entrée passe par CoreAudio (indices 0-based).
     return_sel: Option<Arc<[std::sync::atomic::AtomicUsize; 2]>>,
+    /// Canaux de sortie (0-based) du stream et de l'habillage quand le mixage est fait dans cpal.
+    stream_ch: Option<Arc<[std::sync::atomic::AtomicUsize; 2]>>,
+    branding_ch: Option<Arc<[std::sync::atomic::AtomicUsize; 2]>>,
+    /// Injection du son du téléphone dans le mixeur cpal (macOS).
+    #[cfg(target_os = "macos")]
+    phone_pusher: Option<audio::cpal_out::Pusher>,
+    /// VU-mètres calculés dans les callbacks cpal (macOS).
+    #[cfg(target_os = "macos")]
+    meters_cpal: Option<Arc<audio::cpal_out::Meters>>,
     out_channels: i32,
     in_channels: i32,
 }
@@ -670,115 +682,208 @@ impl Engine {
             in_channels: 0,
         };
 
-        // ----- Sortie vers la carte son (Wing) -----
-        if let Some((out_ch, sink_head, keepalive)) = Self::build_output_sink(pipeline, cfg)? {
-            let max_route = a
-                .stream_output_channels
-                .iter()
-                .chain(a.branding_output_channels.iter())
-                .copied()
-                .max()
-                .unwrap_or(0) as i32;
-            if max_route > out_ch {
-                warn!(
-                    "audio sortie « {} » : routage vers le canal {max_route} mais la sortie n'a \
-                     que {out_ch} canaux.",
-                    a.output_device
+        // ----- Sortie vers la carte son -----
+        // Sur macOS, le mixage/routage/mètres se font dans le callback CoreAudio (cpal), à
+        // l'horloge exacte de la carte : pas de mélangeur GStreamer, une seule horloge. Le son
+        // du téléphone y est poussé directement (voir push_phone_audio), l'habillage via un
+        // appsink. Ailleurs (ou repli), on garde le mélangeur GStreamer.
+        let mut output_done = false;
+        #[cfg(target_os = "macos")]
+        {
+            let out_sel = a.output_device.trim();
+            if !out_sel.is_empty() && !out_sel.eq_ignore_ascii_case("none") {
+                match audio::cpal_out::best_config(out_sel) {
+                    Ok((dev_ch, _sr)) => {
+                        use std::sync::atomic::AtomicUsize;
+                        let out_ch = if a.output_channels > 0 {
+                            a.output_channels
+                        } else {
+                            dev_ch as i32
+                        };
+                        let pair = |chans: &[usize]| {
+                            let c0 = chans.first().copied().unwrap_or(1);
+                            let c1 = chans.get(1).copied().unwrap_or(c0);
+                            Arc::new([
+                                AtomicUsize::new(c0.saturating_sub(1)),
+                                AtomicUsize::new(c1.saturating_sub(1)),
+                            ])
+                        };
+                        let stream_ch = pair(&a.stream_output_channels);
+                        let branding_ch = pair(&a.branding_output_channels);
+                        let meters_arc = Arc::new(audio::cpal_out::Meters::default());
+                        match audio::cpal_out::start_output_mixed(
+                            out_sel,
+                            out_ch as u16,
+                            rate as u32,
+                            stream_ch.clone(),
+                            branding_ch.clone(),
+                            meters_arc.clone(),
+                        ) {
+                            Ok((output, phone_pusher, branding_pusher)) => {
+                                // Habillage : mélange des vidéos (+ silence) par un audiomixer,
+                                // puis appsink qui pousse le stéréo dans le mixeur cpal.
+                                let bmix = make("audiomixer")?;
+                                let silence = gst::ElementFactory::make("audiotestsrc")
+                                    .property("is-live", true)
+                                    .property_from_str("wave", "silence")
+                                    .build()?;
+                                let scaps = capsfilter(&audio::raw_caps(rate, 2))?;
+                                pipeline.add_many([&bmix, &silence, &scaps])?;
+                                link_many(&[&silence, &scaps])?;
+                                let bpad0 = bmix
+                                    .request_pad_simple("sink_%u")
+                                    .context("pad silence habillage")?;
+                                scaps.static_pad("src").unwrap().link(&bpad0)?;
+
+                                let bconv = make("audioconvert")?;
+                                let bres = make("audioresample")?;
+                                let bcaps_val = gst::Caps::builder("audio/x-raw")
+                                    .field("format", "F32LE")
+                                    .field("layout", "interleaved")
+                                    .field("rate", rate)
+                                    .field("channels", 2i32)
+                                    .build();
+                                let bcaps = capsfilter(&bcaps_val)?;
+                                let bsink = gst_app::AppSink::builder()
+                                    .caps(&bcaps_val)
+                                    .sync(false)
+                                    .max_buffers(4)
+                                    .drop(true)
+                                    .build();
+                                bsink.set_callbacks(
+                                    gst_app::AppSinkCallbacks::builder()
+                                        .new_sample(move |s| {
+                                            let sample =
+                                                s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                                            if let Some(buf) = sample.buffer() {
+                                                if let Ok(map) = buf.map_readable() {
+                                                    branding_pusher
+                                                        .push(bytemuck::cast_slice(map.as_slice()));
+                                                }
+                                            }
+                                            Ok(gst::FlowSuccess::Ok)
+                                        })
+                                        .build(),
+                                );
+                                pipeline
+                                    .add_many([&bconv, &bres, &bcaps, bsink.upcast_ref()])?;
+                                link_many(&[&bmix, &bconv, &bres, &bcaps, bsink.upcast_ref()])?;
+                                branding_mixer = Some(bmix);
+
+                                ctl.out_channels = out_ch;
+                                ctl.stream_ch = Some(stream_ch);
+                                ctl.branding_ch = Some(branding_ch);
+                                ctl.phone_pusher = Some(phone_pusher);
+                                ctl.meters_cpal = Some(meters_arc);
+                                route.out_channels = out_ch;
+                                keepalives.push(Box::new(output));
+                                meters.push(("stream".to_string(), "Stream (téléphone)".to_string()));
+                                meters.push(("branding".to_string(), "Habillage".to_string()));
+                                info!(
+                                    "audio sortie « {out_sel} » via CoreAudio ({out_ch} canaux) : \
+                                     habillage→{:?}, stream→{:?} (mixage cpal)",
+                                    a.branding_output_channels, a.stream_output_channels
+                                );
+                                output_done = true;
+                            }
+                            Err(e) => warn!("sortie CoreAudio « {out_sel} » indisponible ({e:#}) ; repli GStreamer"),
+                        }
+                    }
+                    Err(e) => warn!(
+                        "sortie CoreAudio « {} » : {e:#} ; repli GStreamer",
+                        a.output_device
+                    ),
+                }
+            }
+        }
+
+        // Repli GStreamer (autres plateformes, « none », ou CoreAudio indisponible).
+        if !output_done {
+            if let Some((out_ch, sink_head, keepalive)) = Self::build_output_sink(pipeline, cfg)? {
+                if let Some(k) = keepalive {
+                    keepalives.push(k);
+                }
+                ctl.out_channels = out_ch;
+                route.out_channels = out_ch;
+                let out_mixer = make("audiomixer")?;
+                pipeline.add(&out_mixer)?;
+                out_mixer
+                    .link(&sink_head)
+                    .context("liaison mélangeur sortie → sortie audio")?;
+                // Stream (téléphone) via appsrc leaky.
+                {
+                    let stream_caps = gst::Caps::builder("audio/x-raw")
+                        .field("format", "F32LE")
+                        .field("layout", "interleaved")
+                        .field("rate", rate)
+                        .field("channels", 2)
+                        .build();
+                    let src = gst_app::AppSrc::builder()
+                        .caps(&stream_caps)
+                        .is_live(true)
+                        .format(gst::Format::Time)
+                        .do_timestamp(true)
+                        .min_latency(0)
+                        .max_latency(150_000_000)
+                        .max_time(gst::ClockTime::from_mseconds(150))
+                        .leaky_type(gst_app::AppLeakyType::Downstream)
+                        .build();
+                    let c1 = make("audioconvert")?;
+                    let r1 = make("audioresample")?;
+                    let cf1 = capsfilter(&audio::raw_caps(rate, 2))?;
+                    let level = level_element("level_stream", a.meters)?;
+                    let matrix = audio::route_matrix(2, out_ch as usize, &a.stream_output_channels);
+                    let conv = gst::ElementFactory::make("audioconvert")
+                        .property("mix-matrix", audio::to_gst_matrix(&matrix))
+                        .build()?;
+                    let cf2 = capsfilter(&audio::raw_caps(rate, out_ch))?;
+                    pipeline.add_many([src.upcast_ref(), &c1, &r1, &cf1, &level, &conv, &cf2])?;
+                    link_many(&[src.upcast_ref(), &c1, &r1, &cf1, &level, &conv, &cf2])?;
+                    let mpad = out_mixer
+                        .request_pad_simple("sink_%u")
+                        .context("pad mélangeur sortie (stream)")?;
+                    cf2.static_pad("src").unwrap().link(&mpad)?;
+                    ctl.stream_conv = Some(conv);
+                    phone_audio_src = Some(src);
+                    meters.push(("stream".to_string(), "Stream (téléphone)".to_string()));
+                }
+                // Habillage.
+                {
+                    let bmix = make("audiomixer")?;
+                    let silence = gst::ElementFactory::make("audiotestsrc")
+                        .property("is-live", true)
+                        .property_from_str("wave", "silence")
+                        .build()?;
+                    let silence_caps = capsfilter(&audio::raw_caps(rate, 2))?;
+                    pipeline.add_many([&bmix, &silence, &silence_caps])?;
+                    link_many(&[&silence, &silence_caps])?;
+                    let bpad0 = bmix
+                        .request_pad_simple("sink_%u")
+                        .context("pad silence habillage")?;
+                    silence_caps.static_pad("src").unwrap().link(&bpad0)?;
+                    let bcaps = capsfilter(&audio::raw_caps(rate, 2))?;
+                    let level = level_element("level_branding", a.meters)?;
+                    let matrix =
+                        audio::route_matrix(2, out_ch as usize, &a.branding_output_channels);
+                    let conv = gst::ElementFactory::make("audioconvert")
+                        .property("mix-matrix", audio::to_gst_matrix(&matrix))
+                        .build()?;
+                    let cf2 = capsfilter(&audio::raw_caps(rate, out_ch))?;
+                    pipeline.add_many([&bcaps, &level, &conv, &cf2])?;
+                    link_many(&[&bmix, &bcaps, &level, &conv, &cf2])?;
+                    let mpad = out_mixer
+                        .request_pad_simple("sink_%u")
+                        .context("pad mélangeur sortie (habillage)")?;
+                    cf2.static_pad("src").unwrap().link(&mpad)?;
+                    ctl.branding_conv = Some(conv);
+                    branding_mixer = Some(bmix);
+                    meters.push(("branding".to_string(), "Habillage".to_string()));
+                }
+                info!(
+                    "audio sortie « {} » ({} canaux) : habillage→{:?}, stream→{:?}",
+                    a.output_device, out_ch, a.branding_output_channels, a.stream_output_channels
                 );
             }
-            if let Some(k) = keepalive {
-                keepalives.push(k);
-            }
-            ctl.out_channels = out_ch;
-            route.out_channels = out_ch;
-
-            let out_mixer = make("audiomixer")?;
-            pipeline.add(&out_mixer)?;
-            out_mixer
-                .link(&sink_head)
-                .context("liaison mélangeur sortie → sortie audio")?;
-
-            // Branche STREAM (téléphone WebRTC) → canaux stream_output_channels.
-            // Le son du téléphone (autre pipeline, autre horloge) arrive par un appsrc « leaky » :
-            // si l'horloge du téléphone dérive, on jette le plus ancien au lieu de laisser la
-            // latence grossir (le pont interaudiosink/src accumulait sinon plusieurs secondes).
-            {
-                let stream_caps = gst::Caps::builder("audio/x-raw")
-                    .field("format", "F32LE")
-                    .field("layout", "interleaved")
-                    .field("rate", rate)
-                    .field("channels", 2)
-                    .build();
-                let src = gst_app::AppSrc::builder()
-                    .caps(&stream_caps)
-                    .is_live(true)
-                    .format(gst::Format::Time)
-                    .do_timestamp(true)
-                    // Latence bornée : sinon la source live répond « illimité » à la requête de
-                    // latence et le mélangeur (aggregator) échoue avec une erreur d'horloge.
-                    .min_latency(0)
-                    .max_latency(150_000_000) // 150 ms en ns
-                    .max_time(gst::ClockTime::from_mseconds(150))
-                    .leaky_type(gst_app::AppLeakyType::Downstream)
-                    .build();
-                let c1 = make("audioconvert")?;
-                let r1 = make("audioresample")?;
-                let cf1 = capsfilter(&audio::raw_caps(rate, 2))?;
-                let level = level_element("level_stream", a.meters)?;
-                let matrix = audio::route_matrix(2, out_ch as usize, &a.stream_output_channels);
-                let conv = gst::ElementFactory::make("audioconvert")
-                    .property("mix-matrix", audio::to_gst_matrix(&matrix))
-                    .build()?;
-                let cf2 = capsfilter(&audio::raw_caps(rate, out_ch))?;
-                pipeline.add_many([src.upcast_ref(), &c1, &r1, &cf1, &level, &conv, &cf2])?;
-                link_many(&[src.upcast_ref(), &c1, &r1, &cf1, &level, &conv, &cf2])?;
-                let mpad = out_mixer
-                    .request_pad_simple("sink_%u")
-                    .context("pad mélangeur sortie (stream)")?;
-                cf2.static_pad("src").unwrap().link(&mpad)?;
-                ctl.stream_conv = Some(conv);
-                phone_audio_src = Some(src);
-                meters.push(("stream".to_string(), "Stream (téléphone)".to_string()));
-            }
-
-            // Branche HABILLAGE → canaux branding_output_channels.
-            {
-                let bmix = make("audiomixer")?;
-                // Source de silence : garde la branche active même sans vidéo d'habillage.
-                let silence = gst::ElementFactory::make("audiotestsrc")
-                    .property("is-live", true)
-                    .property_from_str("wave", "silence")
-                    .build()?;
-                let silence_caps = capsfilter(&audio::raw_caps(rate, 2))?;
-                pipeline.add_many([&bmix, &silence, &silence_caps])?;
-                link_many(&[&silence, &silence_caps])?;
-                let bpad0 = bmix
-                    .request_pad_simple("sink_%u")
-                    .context("pad silence habillage")?;
-                silence_caps.static_pad("src").unwrap().link(&bpad0)?;
-
-                let bcaps = capsfilter(&audio::raw_caps(rate, 2))?;
-                let level = level_element("level_branding", a.meters)?;
-                let matrix = audio::route_matrix(2, out_ch as usize, &a.branding_output_channels);
-                let conv = gst::ElementFactory::make("audioconvert")
-                    .property("mix-matrix", audio::to_gst_matrix(&matrix))
-                    .build()?;
-                let cf2 = capsfilter(&audio::raw_caps(rate, out_ch))?;
-                pipeline.add_many([&bcaps, &level, &conv, &cf2])?;
-                link_many(&[&bmix, &bcaps, &level, &conv, &cf2])?;
-                let mpad = out_mixer
-                    .request_pad_simple("sink_%u")
-                    .context("pad mélangeur sortie (habillage)")?;
-                cf2.static_pad("src").unwrap().link(&mpad)?;
-                ctl.branding_conv = Some(conv);
-                branding_mixer = Some(bmix);
-                meters.push(("branding".to_string(), "Habillage".to_string()));
-            }
-
-            info!(
-                "audio sortie « {} » ({} canaux) : habillage→{:?}, stream→{:?}",
-                a.output_device, out_ch, a.branding_output_channels, a.stream_output_channels
-            );
         }
 
         // ----- Retour de la carte son → téléphone -----
@@ -787,10 +892,7 @@ impl Engine {
         let sel_in = a.input_device.trim();
         let mut return_done = false;
         #[cfg(target_os = "macos")]
-        if !sel_in.is_empty()
-            && !sel_in.eq_ignore_ascii_case("none")
-            && !sel_in.eq_ignore_ascii_case("default")
-        {
+        if !sel_in.is_empty() && !sel_in.eq_ignore_ascii_case("none") {
             match audio::cpal_out::best_input_config(sel_in) {
                 Ok((in_ch, _in_rate)) => {
                     use std::sync::atomic::AtomicUsize;
@@ -800,7 +902,19 @@ impl Engine {
                         AtomicUsize::new(ch0.saturating_sub(1)),
                         AtomicUsize::new(ch1.saturating_sub(1)),
                     ]);
-                    match audio::cpal_out::start_input(sel_in, in_ch, rate as u32, sel.clone()) {
+                    // Mètres partagés avec la sortie (créés si la sortie n'est pas en cpal).
+                    let meters_arc = ctl.meters_cpal.clone().unwrap_or_else(|| {
+                        let m = Arc::new(audio::cpal_out::Meters::default());
+                        ctl.meters_cpal = Some(m.clone());
+                        m
+                    });
+                    match audio::cpal_out::start_input(
+                        sel_in,
+                        in_ch,
+                        rate as u32,
+                        sel.clone(),
+                        meters_arc,
+                    ) {
                         Ok((input, reader)) => {
                             let caps = gst::Caps::builder("audio/x-raw")
                                 .field("format", "F32LE")
@@ -814,9 +928,9 @@ impl Engine {
                                 .format(gst::Format::Time)
                                 .do_timestamp(true)
                                 .min_latency(0)
-                                .max_latency(150_000_000)
+                                .max_latency(80_000_000) // 80 ms
                                 .leaky_type(gst_app::AppLeakyType::Downstream)
-                                .max_time(gst::ClockTime::from_mseconds(150))
+                                .max_time(gst::ClockTime::from_mseconds(80))
                                 .build();
                             let chunk = (rate as usize / 100).max(1); // 10 ms de trames stéréo
                             appsrc.set_callbacks(
@@ -900,11 +1014,8 @@ impl Engine {
         ))
     }
 
-    /// Construit la fin de la chaîne de sortie audio. Sur macOS avec une carte nommée, la
-    /// sortie passe par CoreAudio (cpal) car `osxaudiosink` se limite à 2 canaux : le graphe
-    /// produit du F32 entrelacé à N canaux, poussé dans un `appsink` vers le flux CoreAudio.
-    /// Retourne (nombre de canaux, élément d'entrée de la chaîne à relier au mélangeur,
-    /// objet à garder en vie).
+    /// Chaîne de sortie GStreamer (repli hors macOS, ou si CoreAudio est indisponible).
+    /// Retourne (nombre de canaux, capsfilter à relier au mélangeur, objet à garder en vie).
     #[allow(clippy::type_complexity)]
     fn build_output_sink(
         pipeline: &gst::Pipeline,
@@ -916,71 +1027,6 @@ impl Engine {
         if sel.is_empty() || sel.eq_ignore_ascii_case("none") {
             return Ok(None);
         }
-
-        #[cfg(target_os = "macos")]
-        if !sel.eq_ignore_ascii_case("default") {
-            match audio::cpal_out::best_config(sel) {
-                Ok((dev_ch, dev_rate)) => {
-                    let ch = if a.output_channels > 0 {
-                        a.output_channels
-                    } else {
-                        dev_ch as i32
-                    };
-                    let sr = dev_rate as i32;
-                    match audio::cpal_out::start(sel, ch as u16, sr as u32) {
-                        Ok((output, pusher)) => {
-                            let caps = gst::Caps::builder("audio/x-raw")
-                                .field("format", "F32LE")
-                                .field("layout", "interleaved")
-                                .field("rate", sr)
-                                .field("channels", ch)
-                                .field("channel-mask", gst::Bitmask::new(0))
-                                .build();
-                            let convert = make("audioconvert")?;
-                            let resample = make("audioresample")?;
-                            let out_caps = capsfilter(&caps)?;
-                            let appsink = gst_app::AppSink::builder()
-                                .caps(&caps)
-                                .sync(false)
-                                .max_buffers(4)
-                                .drop(true)
-                                .build();
-                            appsink.set_callbacks(
-                                gst_app::AppSinkCallbacks::builder()
-                                    .new_sample(move |s| {
-                                        let sample =
-                                            s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                                        if let Some(buf) = sample.buffer() {
-                                            if let Ok(map) = buf.map_readable() {
-                                                let f: &[f32] =
-                                                    bytemuck::cast_slice(map.as_slice());
-                                                pusher.push(f);
-                                            }
-                                        }
-                                        Ok(gst::FlowSuccess::Ok)
-                                    })
-                                    .build(),
-                            );
-                            pipeline.add_many([
-                                &convert,
-                                &resample,
-                                &out_caps,
-                                appsink.upcast_ref(),
-                            ])?;
-                            link_many(&[&convert, &resample, &out_caps, appsink.upcast_ref()])?;
-                            info!("audio sortie « {sel} » via CoreAudio : {ch} canaux @ {sr} Hz");
-                            return Ok(Some((ch, convert, Some(Box::new(output)))));
-                        }
-                        Err(e) => {
-                            warn!("CoreAudio « {sel} » indisponible ({e:#}) ; repli GStreamer")
-                        }
-                    }
-                }
-                Err(e) => warn!("CoreAudio « {sel} » : {e:#} ; repli GStreamer"),
-            }
-        }
-
-        // Repli (autres plateformes, « default », ou CoreAudio indisponible) : sink GStreamer.
         if let Some((sink, out_ch)) =
             audio::make_device_element(sel, audio::Direction::Sink, a.output_channels)?
         {
@@ -996,16 +1042,28 @@ impl Engine {
     /// Change à chaud les canaux d'une source audio (mix-matrix de l'`audioconvert`).
     pub fn set_audio_route(&self, target: &str, channels: &[usize]) -> bool {
         let ctl = &self.audio_ctl;
-        // Retour via CoreAudio : la sélection se fait par atomics dans le callback d'entrée.
-        if target == "return" {
-            if let Some(sel) = &ctl.return_sel {
-                use std::sync::atomic::Ordering;
+        // Chemin cpal (macOS) : le routage se fait par atomics lus dans les callbacks CoreAudio.
+        {
+            use std::sync::atomic::Ordering;
+            let cpal_sel = match target {
+                "stream" => ctl.stream_ch.as_ref(),
+                "branding" => ctl.branding_ch.as_ref(),
+                "return" => ctl.return_sel.as_ref(),
+                _ => None,
+            };
+            if let Some(sel) = cpal_sel {
                 let c0 = channels.first().copied().unwrap_or(1);
                 let c1 = channels.get(1).copied().unwrap_or(c0);
                 sel[0].store(c0.saturating_sub(1), Ordering::Relaxed);
                 sel[1].store(c1.saturating_sub(1), Ordering::Relaxed);
-                self.route.lock().unwrap().return_input = channels.to_vec();
-                info!("audio : return re-routé vers {channels:?}");
+                let mut route = self.route.lock().unwrap();
+                match target {
+                    "stream" => route.stream = channels.to_vec(),
+                    "branding" => route.branding = channels.to_vec(),
+                    "return" => route.return_input = channels.to_vec(),
+                    _ => {}
+                }
+                info!("audio : {target} re-routé vers {channels:?} (cpal)");
                 return true;
             }
         }
@@ -1042,6 +1100,29 @@ impl Engine {
     }
 
     pub fn meters(&self) -> Vec<AudioMeter> {
+        // Chemin cpal (macOS) : niveaux calculés dans les callbacks CoreAudio.
+        #[cfg(target_os = "macos")]
+        if let Some(m) = &self.audio_ctl.meters_cpal {
+            return self
+                .meter_order
+                .iter()
+                .map(|(id, label)| {
+                    let src = match id.as_str() {
+                        "branding" => &m.branding,
+                        "return" => &m.ret,
+                        _ => &m.stream,
+                    };
+                    let (rms_db, peak_db) = src.read_db();
+                    AudioMeter {
+                        id: id.clone(),
+                        label: label.clone(),
+                        rms_db,
+                        peak_db,
+                    }
+                })
+                .collect();
+        }
+        // Chemin GStreamer : niveaux relevés par les éléments `level` sur le bus.
         let m = self.meters.lock().unwrap();
         self.meter_order
             .iter()
@@ -1171,8 +1252,16 @@ impl Engine {
     }
 
     /// Injecte un tampon de son du téléphone (F32 stéréo 48 kHz) dans la sortie audio.
-    /// L'appsrc « leaky » borne la latence en cas de dérive d'horloge.
     pub fn push_phone_audio(&self, buffer: gst::Buffer) {
+        // Chemin cpal (macOS) : on pousse les échantillons dans le mixeur CoreAudio.
+        #[cfg(target_os = "macos")]
+        if let Some(p) = &self.audio_ctl.phone_pusher {
+            if let Ok(map) = buffer.map_readable() {
+                p.push(bytemuck::cast_slice(map.as_slice()));
+            }
+            return;
+        }
+        // Chemin GStreamer : appsrc « leaky » vers le mélangeur.
         if let Some(src) = &self.phone_audio_src {
             let _ = src.push_buffer(buffer);
         }

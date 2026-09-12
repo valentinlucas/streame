@@ -46,7 +46,7 @@ impl Default for ServerConfig {
             bind: "0.0.0.0:8443".into(),
             cert_dir: "certs".into(),
             stun_server: "stun://stun.l.google.com:19302".into(),
-            rtc_latency_ms: 120,
+            rtc_latency_ms: 60,
             video_codec: "H264".into(),
             h264_profile_level_id: "42e01f".into(),
             return_audio_bitrate: 64000,

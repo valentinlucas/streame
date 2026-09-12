@@ -103,7 +103,7 @@ Voir `streame.example.toml` pour un exemple complet. Principales sections :
 bind = "0.0.0.0:8443"
 video_codec = "H264"          # ou "VP8"
 h264_profile_level_id = "42e01f"   # "640c1f" = profil High (meilleure qualité sur iPhone récent)
-rtc_latency_ms = 120          # jitter buffer WebRTC
+rtc_latency_ms = 60           # jitter buffer WebRTC (baisser sur LAN propre = moins de latence)
 
 [video]
 width = 1920                  # taille du canevas des scènes (la sortie suit l'écran)
@@ -191,15 +191,16 @@ disponibles dans `GET /api/state`.
 - Un seul téléphone simultané (le canal « phone » est unique) ; plusieurs sources = plusieurs canaux à ajouter.
 - Les fichiers vidéo sont décodés par GStreamer et envoyés au GPU image par image (suffisant pour des overlays 1080p).
 - Pas d'enregistrement ni de streaming RTMP.
-- **E/S carte via CoreAudio (macOS)** : `osxaudiosink` de GStreamer se limite à 2 canaux de
-  sortie, et ouvrir la même carte à la fois par cpal (sortie) et GStreamer (entrée) finissait par
-  la coincer. `streame` fait donc passer **toute l'E/S de la carte nommée par CoreAudio (cpal)** :
-  la sortie (N canaux, détectés automatiquement, 8 sur la Wing) via un `appsink`, et l'entrée
-  (retour vers le téléphone) via un flux d'entrée cpal → `appsrc`. GStreamer garde le mixage, le
-  routage, les VU-mètres et les codecs, mais ne touche plus le périphérique — un seul framework
-  possède la carte. Les flux sont fermés proprement à l'arrêt (Ctrl-C / fermeture) pour ne pas
-  laisser la carte USB dans un état bloqué. Pour `output_device`/`input_device = "default"`, on
-  repasse par GStreamer (stéréo).
+- **Audio via CoreAudio (macOS)** : sur macOS, **toute la chaîne carte passe par CoreAudio (cpal)**.
+  Le mixage des deux sources (stream du téléphone et habillage), leur routage sur les canaux
+  choisis et les VU-mètres sont calculés directement dans le callback temps réel de la carte, à
+  son horloge exacte — pas de mélangeur GStreamer, une seule horloge, synchro et latence
+  minimales. GStreamer ne fait plus que décoder (WebRTC, fichiers d'habillage) et coder (Opus du
+  retour) ; il ne touche plus le périphérique, ce qui supprime le conflit à deux frameworks qui
+  coinçait la Wing. La sortie ouvre autant de canaux que la carte en expose (8 sur la Wing),
+  l'entrée alimente le retour vers le téléphone. Les flux sont fermés proprement à l'arrêt
+  (Ctrl-C, fermeture) pour ne pas laisser la carte USB bloquée. Hors macOS, c'est GStreamer qui
+  fait le mixage et l'E/S.
 - Le retour audio vers le téléphone est stéréo 48 kHz Opus ; l'annulation d'écho est faite côté téléphone.
 - Sur Chrome/Android, forcer `video_codec = "VP8"` si le H264 matériel n'est pas disponible.
 - La négociation active l'extension d'en-tête RTP *transport-wide-cc* : sans elle, l'estimation

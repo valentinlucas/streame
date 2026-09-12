@@ -197,6 +197,8 @@ pub mod cpal_out {
     use std::sync::{Arc, Mutex};
     use tracing::{error, info, warn};
 
+    use std::sync::atomic::AtomicU32;
+
     type Prod = ringbuf::HeapProd<f32>;
 
     /// Poignée d'écriture (côté appsink GStreamer). Le consommateur vit dans le thread temps
@@ -208,6 +210,63 @@ pub mod cpal_out {
         target: usize,
         capacity: usize,
         channels: usize,
+    }
+
+    /// VU-mètre d'une source (2 canaux), mis à jour dans le callback temps réel (sans verrou).
+    #[derive(Default)]
+    pub struct SourceMeter {
+        rms: [AtomicU32; 2],
+        peak: [AtomicU32; 2],
+    }
+
+    impl SourceMeter {
+        /// Calcule RMS/crête par canal sur un bloc stéréo entrelacé et les stocke.
+        fn store_stereo(&self, buf: &[f32]) {
+            for ch in 0..2 {
+                let mut sum = 0f64;
+                let mut peak = 0f32;
+                let mut n = 0u32;
+                let mut i = ch;
+                while i < buf.len() {
+                    let x = buf[i];
+                    sum += (x as f64) * (x as f64);
+                    peak = peak.max(x.abs());
+                    n += 1;
+                    i += 2;
+                }
+                let rms = if n > 0 {
+                    (sum / n as f64).sqrt() as f32
+                } else {
+                    0.0
+                };
+                self.rms[ch].store(rms.to_bits(), Ordering::Relaxed);
+                self.peak[ch].store(peak.to_bits(), Ordering::Relaxed);
+            }
+        }
+
+        /// (rms_dBFS, peak_dBFS) par canal.
+        pub fn read_db(&self) -> (Vec<f32>, Vec<f32>) {
+            let db = |bits: &AtomicU32| {
+                let x = f32::from_bits(bits.load(Ordering::Relaxed));
+                if x <= 1e-6 {
+                    -100.0
+                } else {
+                    20.0 * x.log10()
+                }
+            };
+            (
+                vec![db(&self.rms[0]), db(&self.rms[1])],
+                vec![db(&self.peak[0]), db(&self.peak[1])],
+            )
+        }
+    }
+
+    /// VU-mètres partagés (calculés dans les callbacks CoreAudio, lus par l'API/le multiview).
+    #[derive(Default)]
+    pub struct Meters {
+        pub stream: SourceMeter,
+        pub branding: SourceMeter,
+        pub ret: SourceMeter,
     }
 
     /// Objet à garder en vie : maintient le thread et le flux CoreAudio.
@@ -228,6 +287,11 @@ pub mod cpal_out {
 
     fn find_device(name: &str) -> Result<cpal::Device> {
         let host = cpal::default_host();
+        if name.trim().eq_ignore_ascii_case("default") || name.trim().is_empty() {
+            return host
+                .default_output_device()
+                .ok_or_else(|| anyhow!("aucune sortie CoreAudio par défaut"));
+        }
         let low = name.to_lowercase();
         host.output_devices()?
             .find(|d| {
@@ -258,44 +322,75 @@ pub mod cpal_out {
         Ok(best)
     }
 
-    /// Ouvre le flux CoreAudio. Le consommateur (thread temps réel) lit le tampon sans verrou :
-    /// silence tant qu'on n'a pas atteint la cible de latence (amorçage), puis lecture continue.
-    pub fn start(name: &str, channels: u16, sample_rate: u32) -> Result<(Output, Pusher)> {
+    /// Ouvre le flux CoreAudio de SORTIE et fait le mixage/routage/mètres directement dans le
+    /// callback temps réel, à l'horloge exacte de la carte. Deux sources stéréo (stream du
+    /// téléphone et habillage) sont fournies par GStreamer via les `Pusher` renvoyés ; chacune
+    /// est placée sur ses canaux (`stream_ch`/`branding_ch`, 0-based, modifiables à chaud) et
+    /// sommée dans les N canaux de la carte.
+    #[allow(clippy::type_complexity)]
+    pub fn start_output_mixed(
+        name: &str,
+        out_channels: u16,
+        sample_rate: u32,
+        stream_ch: Arc<[AtomicUsize; 2]>,
+        branding_ch: Arc<[AtomicUsize; 2]>,
+        meters: Arc<Meters>,
+    ) -> Result<(Output, Pusher, Pusher)> {
         let dev = find_device(name)?;
         let config = cpal::StreamConfig {
-            channels,
+            channels: out_channels,
             sample_rate: cpal::SampleRate(sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
-        let ch = channels as usize;
-        // Cible ~50 ms, capacité ~400 ms.
-        let target = (sample_rate as usize * ch * 50 / 1000).max(ch);
-        let capacity = (sample_rate as usize * ch * 400 / 1000).max(target * 2);
-        let (prod, mut cons) = HeapRb::<f32>::new(capacity).split();
+        let n = out_channels as usize;
+        let cap = (sample_rate as usize * 2 * 400 / 1000).max(4); // stéréo, ~400 ms
+        let (phone_prod, mut phone_cons) = HeapRb::<f32>::new(cap).split();
+        let (brand_prod, mut brand_cons) = HeapRb::<f32>::new(cap).split();
+        // Scratch réutilisé (pas d'allocation dans le callback temps réel, sauf dépassement rare).
+        let mut pbuf = vec![0f32; 8192 * 2];
+        let mut bbuf = vec![0f32; 8192 * 2];
+        let meters_cb = meters.clone();
+        let (sc, bc) = (stream_ch, branding_ch);
 
         let stop = Arc::new(AtomicBool::new(false));
         let (stop_thread, name_owned) = (stop.clone(), name.to_string());
-        // Amorçage : on démarre la lecture quand le tampon a atteint la cible, pour éviter
-        // les sous-alimentations en rafale au début.
-        let mut primed = false;
         let thread = std::thread::Builder::new()
             .name("cpal-out".into())
             .spawn(move || {
                 let stream = match dev.build_output_stream(
                     &config,
                     move |out: &mut [f32], _| {
-                        if !primed {
-                            if cons.occupied_len() < target {
-                                out.iter_mut().for_each(|s| *s = 0.0);
-                                return;
-                            }
-                            primed = true;
+                        let frames = if n > 0 { out.len() / n } else { 0 };
+                        let need = frames * 2;
+                        if need > pbuf.len() {
+                            pbuf.resize(need, 0.0);
+                            bbuf.resize(need, 0.0);
                         }
-                        let got = cons.pop_slice(out);
-                        // Sous-alimentation : on complète en silence et on redemande un amorçage.
-                        if got < out.len() {
-                            out[got..].iter_mut().for_each(|s| *s = 0.0);
-                            primed = false;
+                        let pn = phone_cons.pop_slice(&mut pbuf[..need]);
+                        pbuf[pn..need].iter_mut().for_each(|s| *s = 0.0);
+                        let bn = brand_cons.pop_slice(&mut bbuf[..need]);
+                        bbuf[bn..need].iter_mut().for_each(|s| *s = 0.0);
+                        meters_cb.stream.store_stereo(&pbuf[..need]);
+                        meters_cb.branding.store_stereo(&bbuf[..need]);
+                        let (s0, s1) = (sc[0].load(Ordering::Relaxed), sc[1].load(Ordering::Relaxed));
+                        let (b0, b1) = (bc[0].load(Ordering::Relaxed), bc[1].load(Ordering::Relaxed));
+                        out.iter_mut().for_each(|s| *s = 0.0);
+                        for f in 0..frames {
+                            let ob = f * n;
+                            let (pl, pr) = (pbuf[f * 2], pbuf[f * 2 + 1]);
+                            let (bl, br) = (bbuf[f * 2], bbuf[f * 2 + 1]);
+                            if s0 < n {
+                                out[ob + s0] += pl;
+                            }
+                            if s1 < n {
+                                out[ob + s1] += pr;
+                            }
+                            if b0 < n {
+                                out[ob + b0] += bl;
+                            }
+                            if b1 < n {
+                                out[ob + b1] += br;
+                            }
                         }
                     },
                     |e| error!("flux CoreAudio : {e}"),
@@ -311,24 +406,25 @@ pub mod cpal_out {
                     error!("démarrage du flux CoreAudio : {e}");
                     return;
                 }
-                info!("sortie CoreAudio « {name_owned} » : {channels} canaux @ {sample_rate} Hz");
+                info!("sortie CoreAudio « {name_owned} » : {out_channels} canaux @ {sample_rate} Hz (mixage cpal)");
                 while !stop_thread.load(Ordering::Relaxed) {
                     std::thread::park_timeout(std::time::Duration::from_millis(250));
                 }
             })?;
 
-        let pusher = Pusher {
+        let mk = |prod| Pusher {
             prod: Arc::new(Mutex::new(prod)),
-            target,
-            capacity,
-            channels: ch,
+            target: (sample_rate as usize * 2 * 30 / 1000).max(2), // ~30 ms de rétention max
+            capacity: cap,
+            channels: 2,
         };
         Ok((
             Output {
                 stop,
                 thread: Some(thread),
             },
-            pusher,
+            mk(phone_prod),
+            mk(brand_prod),
         ))
     }
 
@@ -382,6 +478,11 @@ pub mod cpal_out {
 
     fn find_input_device(name: &str) -> Result<cpal::Device> {
         let host = cpal::default_host();
+        if name.trim().eq_ignore_ascii_case("default") || name.trim().is_empty() {
+            return host
+                .default_input_device()
+                .ok_or_else(|| anyhow!("aucune entrée CoreAudio par défaut"));
+        }
         let low = name.to_lowercase();
         host.input_devices()?
             .find(|d| {
@@ -419,6 +520,7 @@ pub mod cpal_out {
         in_channels: u16,
         sample_rate: u32,
         sel: Arc<[AtomicUsize; 2]>,
+        meters: Arc<Meters>,
     ) -> Result<(Output, Reader)> {
         let dev = find_input_device(name)?;
         let config = cpal::StreamConfig {
@@ -431,6 +533,7 @@ pub mod cpal_out {
         let (mut prod, cons) = HeapRb::<f32>::new(capacity).split();
         let stop = Arc::new(AtomicBool::new(false));
         let (stop_thread, name_owned) = (stop.clone(), name.to_string());
+        let mut sbuf = vec![0f32; 8192 * 2]; // scratch stéréo réutilisé
         let thread = std::thread::Builder::new()
             .name("cpal-in".into())
             .spawn(move || {
@@ -443,14 +546,18 @@ pub mod cpal_out {
                         let i0 = sel[0].load(Ordering::Relaxed).min(in_ch - 1);
                         let i1 = sel[1].load(Ordering::Relaxed).min(in_ch - 1);
                         let frames = data.len() / in_ch;
+                        let need = frames * 2;
+                        if need > sbuf.len() {
+                            sbuf.resize(need, 0.0);
+                        }
                         for f in 0..frames {
                             let base = f * in_ch;
-                            // Plein : on jette (le tampon reste borné, la latence aussi).
-                            if prod.try_push(data[base + i0]).is_err() {
-                                break;
-                            }
-                            let _ = prod.try_push(data[base + i1]);
+                            sbuf[f * 2] = data[base + i0];
+                            sbuf[f * 2 + 1] = data[base + i1];
                         }
+                        meters.ret.store_stereo(&sbuf[..need]);
+                        // Plein : on jette (le tampon reste borné, la latence aussi).
+                        let _ = prod.push_slice(&sbuf[..need]);
                     },
                     |e| error!("flux d'entrée CoreAudio : {e}"),
                     None,
