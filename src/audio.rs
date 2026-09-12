@@ -499,16 +499,54 @@ pub mod cpal_out {
     #[derive(Clone)]
     pub struct Reader {
         cons: Arc<Mutex<Cons>>,
+        /// Pré-tampon : vrai une fois qu'on a accumulé assez d'échantillons pour jouer.
+        primed: Arc<AtomicBool>,
+        /// Seuil de pré-tampon (échantillons) avant de commencer / après une sous-alimentation.
+        prime: usize,
+        /// Au-delà, on jette les échantillons les plus anciens (anti-dérive : la carte va plus
+        /// vite que GStreamer) pour ne pas laisser la latence du retour grandir.
+        drift_max: usize,
     }
 
     impl Reader {
         /// Remplit `out` (F32 stéréo entrelacé) avec le retour disponible ; renvoie le nombre
-        /// d'échantillons fournis (le reste est à compléter en silence par l'appelant).
+        /// d'échantillons réels fournis (le reste, laissé à zéro par l'appelant, est du silence).
+        ///
+        /// Pré-tamponné : tant qu'on n'a pas accumulé `prime` échantillons on ne joue rien (silence
+        /// propre), et une sous-alimentation repasse en pré-tampon — sinon la moindre gigue
+        /// entre l'horloge de la carte et celle de GStreamer donnait des trames moitié son /
+        /// moitié silence, d'où le son haché du retour vers le téléphone.
         pub fn pull(&self, out: &mut [f32]) -> usize {
-            match self.cons.lock() {
-                Ok(mut c) => c.pop_slice(out),
-                Err(_) => 0,
+            let Ok(mut c) = self.cons.lock() else {
+                return 0;
+            };
+            // Anti-dérive : si le retard s'accumule, on saute les échantillons les plus anciens
+            // pour revenir au niveau du pré-tampon (garde la latence bornée).
+            let occupied = c.occupied_len();
+            if occupied > self.drift_max {
+                let mut skip = (occupied - self.prime) & !1; // aligné sur la trame stéréo
+                let mut junk = [0f32; 1024];
+                while skip > 0 {
+                    let n = junk.len().min(skip);
+                    let got = c.pop_slice(&mut junk[..n]);
+                    if got == 0 {
+                        break;
+                    }
+                    skip -= got;
+                }
             }
+            if !self.primed.load(Ordering::Relaxed) {
+                if c.occupied_len() >= self.prime {
+                    self.primed.store(true, Ordering::Relaxed);
+                } else {
+                    return 0; // silence le temps de constituer le pré-tampon
+                }
+            }
+            let n = c.pop_slice(out);
+            if n < out.len() {
+                self.primed.store(false, Ordering::Relaxed); // sous-alimentation → on re-tamponne
+            }
+            n
         }
     }
 
@@ -619,6 +657,10 @@ pub mod cpal_out {
                     std::thread::park_timeout(std::time::Duration::from_millis(250));
                 }
             })?;
+        // Pré-tampon ~60 ms : absorbe la gigue et la dérive entre l'horloge de la carte et celle
+        // de GStreamer côté retour (le téléphone a son propre jitter buffer par-dessus).
+        let prime = (sample_rate as usize * 2 * 60 / 1000).max(2);
+        let drift_max = (sample_rate as usize * 2 * 200 / 1000).max(prime * 2); // ~200 ms
         Ok((
             Output {
                 stop,
@@ -626,6 +668,9 @@ pub mod cpal_out {
             },
             Reader {
                 cons: Arc::new(Mutex::new(cons)),
+                primed: Arc::new(AtomicBool::new(false)),
+                prime,
+                drift_max,
             },
         ))
     }
