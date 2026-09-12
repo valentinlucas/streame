@@ -138,7 +138,7 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
                             info!("téléphone « {} » remplacé par « {name} »", old.name);
                             old.close();
                         }
-                        match PhoneSession::start(&state.cfg, name, tx.clone(), state.engine.clone()) {
+                        match PhoneSession::start(&state.cfg, name, tx.clone(), state.engine.clone()).await {
                             Ok(s) => {
                                 *state.phone.lock().unwrap() = Some(s.clone());
                                 session = Some(s);
@@ -152,14 +152,14 @@ async fn handle_phone(socket: WebSocket, state: Shared) {
                     }
                     ClientMsg::Answer { sdp } => {
                         if let Some(s) = &session {
-                            if let Err(e) = s.set_answer(&sdp) {
+                            if let Err(e) = s.set_answer(&sdp).await {
                                 warn!("réponse SDP : {e:#}");
                             }
                         }
                     }
                     ClientMsg::Ice { candidate, sdp_m_line_index } => {
                         if let Some(s) = &session {
-                            s.add_ice(sdp_m_line_index, &candidate);
+                            s.add_ice(sdp_m_line_index, &candidate).await;
                         }
                     }
                     ClientMsg::Stats(st) => {

@@ -6,13 +6,19 @@ description = "Régie vidéo légère : caméra/son d'un téléphone en WebRTC �
 license = "MIT"
 
 [dependencies]
-# GStreamer
+# GStreamer (décodage matériel + codecs uniquement ; le transport WebRTC est géré par webrtc-rs)
 gst = { package = "gstreamer", version = "0.25" }
 gst-app = { package = "gstreamer-app", version = "0.25", features = ["v1_20"] }
 gst-video = { package = "gstreamer-video", version = "0.25" }
 gst-audio = { package = "gstreamer-audio", version = "0.25" }
-gst-webrtc = { package = "gstreamer-webrtc", version = "0.25" }
-gst-sdp = { package = "gstreamer-sdp", version = "0.25" }
+
+# WebRTC en Rust (crate async `webrtc` + cœur sans-I/O `rtc`) : ICE/DTLS/SRTP/RTP,
+# jitter buffer, TWCC/NACK. Remplace webrtcbin de GStreamer.
+webrtc = "=0.21.0-rc.2"
+rtc = "=0.21.0-rc.2"
+async-trait = "0.1"
+bytes = "1"
+rand = "0.8"
 
 # Serveur web + signaling
 tokio = { version = "1", features = ["full"] }
