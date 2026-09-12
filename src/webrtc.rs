@@ -107,8 +107,10 @@ pub struct PhoneSession {
     pub name: String,
     pub cancel: CancellationToken,
     pc: Arc<dyn PeerConnection>,
-    /// Pipeline de décodage des flux entrants (une branche appsrc→decodebin par piste).
-    decode_pipeline: gst::Pipeline,
+    /// Un pipeline de décodage **par piste entrante** (audio, vidéo). Chaque piste est isolée :
+    /// deux pistes partageant un seul pipeline se gênaient (l'autoplug de la 2e decodebin
+    /// échouait par intermittence → image OU son manquant selon la piste arrivée en second).
+    decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>>,
     /// Pipeline du son de retour (carte → Opus → piste locale webrtc-rs).
     return_pipeline: gst::Pipeline,
 }
@@ -118,7 +120,7 @@ pub struct PhoneSession {
 struct Handler {
     engine: Arc<Engine>,
     out: mpsc::UnboundedSender<ServerMsg>,
-    decode_pipeline: gst::Pipeline,
+    decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>>,
     cancel: CancellationToken,
     name: String,
     /// Codec vidéo réellement négocié (rempli à l'arrivée de la piste), pour l'affichage /control.
@@ -173,12 +175,14 @@ impl PeerConnectionEventHandler for Handler {
         }
         info!("piste {media}/{encoding} du téléphone (ssrc {media_ssrc}, {clock_rate} Hz)");
 
-        // Chaîne de décodage explicite (dépay + décodeur câblés à l'avance) plutôt que
-        // decodebin : l'autoplug de decodebin depuis application/x-rtp est asynchrone et laissait
-        // tomber la 1re image-clé sur la 1re connexion (image absente tant qu'une autre image-clé
-        // n'arrivait pas → « ça revient en relançant »). Ici tout est lié avant le 1er paquet.
-        let appsrc = match build_decode_chain(&self.decode_pipeline, media, encoding, &self.engine) {
-            Ok(a) => a,
+        // Un pipeline dédié par piste (voir PhoneSession::decode_pipelines) : isolation totale,
+        // pas d'interférence entre l'audio et la vidéo au démarrage.
+        let pipe_name = format!("decode-{}-{media}", self.name.replace(' ', "_"));
+        let appsrc = match build_decode_chain(&pipe_name, &self.engine) {
+            Ok((pipe, appsrc)) => {
+                self.decode_pipelines.lock().unwrap().push(pipe);
+                appsrc
+            }
             Err(e) => {
                 error!("mise en place du décodage {media}/{encoding} : {e:#}");
                 return;
@@ -346,13 +350,12 @@ impl PhoneSession {
             .build();
 
         // --- Gestionnaire d'événements --------------------------------------------------------
-        let decode_pipeline =
-            gst::Pipeline::with_name(&format!("phone-{}", name.replace(' ', "_")));
+        let decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>> = Arc::new(StdMutex::new(Vec::new()));
         let video_codec = Arc::new(StdMutex::new(cfg.server.video_codec.to_uppercase()));
         let handler = Arc::new(Handler {
             engine: engine.clone(),
             out: out.clone(),
-            decode_pipeline: decode_pipeline.clone(),
+            decode_pipelines: decode_pipelines.clone(),
             cancel: cancel.clone(),
             name: name.clone(),
             video_codec: video_codec.clone(),
@@ -437,14 +440,9 @@ impl PhoneSession {
         // --- Statistiques RTP (toutes les secondes) -------------------------------------------
         spawn_stats(pc.clone(), engine.clone(), video_codec, cancel.clone());
 
-        // Surveillance des bus : sans elle, une erreur de decodebin (pas de décodeur, caps
-        // incompatibles, pads non liés) passe totalement inaperçue.
-        spawn_bus_watch(&decode_pipeline, format!("decode-{name}"));
+        // Surveillance du bus du retour (les pipelines de décodage sont surveillés à leur
+        // création dans build_decode_chain).
         spawn_bus_watch(&return_pipeline, format!("return-{name}"));
-
-        decode_pipeline
-            .set_state(gst::State::Playing)
-            .context("démarrage du pipeline de décodage")?;
         return_pipeline
             .set_state(gst::State::Playing)
             .context("démarrage du pipeline de retour")?;
@@ -454,7 +452,7 @@ impl PhoneSession {
             name,
             cancel,
             pc,
-            decode_pipeline,
+            decode_pipelines,
             return_pipeline,
         }))
     }
@@ -489,12 +487,13 @@ impl PhoneSession {
 
     pub fn close(&self) {
         self.cancel.cancel();
-        let _ = self.decode_pipeline.set_state(gst::State::Null);
-        let _ = self.return_pipeline.set_state(gst::State::Null);
-        // Débloque les threads de surveillance des bus (iter_timed).
-        if let Some(b) = self.decode_pipeline.bus() {
-            b.set_flushing(true);
+        for pipe in self.decode_pipelines.lock().unwrap().iter() {
+            let _ = pipe.set_state(gst::State::Null);
+            if let Some(b) = pipe.bus() {
+                b.set_flushing(true); // débloque le thread de surveillance (iter_timed)
+            }
         }
+        let _ = self.return_pipeline.set_state(gst::State::Null);
         if let Some(b) = self.return_pipeline.bus() {
             b.set_flushing(true);
         }
@@ -564,16 +563,14 @@ fn rtp_media_encoding(kind: RtpCodecKind, mime: &str) -> (&'static str, &'static
     }
 }
 
-/// Construit la chaîne de décodage : `appsrc(application/x-rtp) → decodebin`. decodebin
-/// auto-branche le dépayloadeur + le décodeur (matériel via vtdec) selon les caps, et
-/// `attach_decoded_branch` relie la sortie décodée au moteur (GPU pour la vidéo, cpal pour
-/// l'audio). Les caps de l'appsrc sont posées au 1er paquet dans la boucle de lecture.
-fn build_decode_chain(
-    pipe: &gst::Pipeline,
-    _media: &str,
-    _encoding: &str,
-    engine: &Arc<Engine>,
-) -> Result<gst_app::AppSrc> {
+/// Construit un **pipeline dédié** pour une piste entrante : `appsrc(application/x-rtp) →
+/// decodebin`. decodebin auto-branche le dépayloadeur + le décodeur (matériel via vtdec) selon
+/// les caps, et `attach_decoded_branch` relie la sortie décodée au moteur (GPU pour la vidéo,
+/// cpal pour l'audio). Le pipeline est démarré et surveillé ici ; les caps de l'appsrc sont
+/// posées au 1er paquet dans la boucle de lecture. Renvoie le pipeline (à conserver et arrêter)
+/// et l'appsrc où pousser le RTP.
+fn build_decode_chain(name: &str, engine: &Arc<Engine>) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+    let pipe = gst::Pipeline::with_name(name);
     let appsrc = gst_app::AppSrc::builder()
         .is_live(true)
         .format(gst::Format::Time)
@@ -583,16 +580,17 @@ fn build_decode_chain(
     let decode = gst::ElementFactory::make("decodebin").build()?;
     pipe.add_many([&src, &decode])?;
     src.link(&decode)?;
-    let engine = engine.clone();
+    let engine2 = engine.clone();
     let pipe2 = pipe.clone();
     decode.connect_pad_added(move |_, dpad| {
-        if let Err(e) = attach_decoded_branch(&pipe2, dpad, &engine) {
+        if let Err(e) = attach_decoded_branch(&pipe2, dpad, &engine2) {
             error!("branche de décodage : {e:#}");
         }
     });
-    src.sync_state_with_parent()?;
-    decode.sync_state_with_parent()?;
-    Ok(appsrc)
+    spawn_bus_watch(&pipe, name.to_string());
+    pipe.set_state(gst::State::Playing)
+        .with_context(|| format!("démarrage du pipeline de décodage « {name} »"))?;
+    Ok((pipe, appsrc))
 }
 
 /// Construit la branche de décodage à partir d'un pad `decodebin` (repli codec inconnu).
