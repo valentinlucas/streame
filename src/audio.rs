@@ -357,6 +357,12 @@ pub mod cpal_out {
         let mut bbuf = vec![0f32; 8192 * 2];
         let meters_cb = meters.clone();
         let (sc, bc) = (stream_ch, branding_ch);
+        // Pré-tampon : on attend d'avoir accumulé ~90 ms avant de jouer une source, sinon la
+        // moindre gigue vide l'anneau et le callback comble avec du silence → son haché. En cas
+        // de sous-alimentation on repasse en pré-tampon (une coupure nette plutôt qu'un hachis).
+        let prime = (sample_rate as usize * 2 * 90 / 1000).max(2);
+        let mut phone_primed = false;
+        let mut brand_primed = false;
 
         let stop = Arc::new(AtomicBool::new(false));
         let (stop_thread, name_owned) = (stop.clone(), name.to_string());
@@ -372,10 +378,32 @@ pub mod cpal_out {
                             pbuf.resize(need, 0.0);
                             bbuf.resize(need, 0.0);
                         }
-                        let pn = phone_cons.pop_slice(&mut pbuf[..need]);
+                        // Source téléphone : lecture pré-tamponnée.
+                        if !phone_primed && phone_cons.occupied_len() >= prime {
+                            phone_primed = true;
+                        }
+                        let pn = if phone_primed {
+                            phone_cons.pop_slice(&mut pbuf[..need])
+                        } else {
+                            0
+                        };
                         pbuf[pn..need].iter_mut().for_each(|s| *s = 0.0);
-                        let bn = brand_cons.pop_slice(&mut bbuf[..need]);
+                        if phone_primed && pn < need {
+                            phone_primed = false; // sous-alimentation → on re-tamponne
+                        }
+                        // Source habillage : idem.
+                        if !brand_primed && brand_cons.occupied_len() >= prime {
+                            brand_primed = true;
+                        }
+                        let bn = if brand_primed {
+                            brand_cons.pop_slice(&mut bbuf[..need])
+                        } else {
+                            0
+                        };
                         bbuf[bn..need].iter_mut().for_each(|s| *s = 0.0);
+                        if brand_primed && bn < need {
+                            brand_primed = false;
+                        }
                         meters_cb.stream.store_stereo(&pbuf[..need]);
                         meters_cb.branding.store_stereo(&bbuf[..need]);
                         let (s0, s1) = (sc[0].load(Ordering::Relaxed), sc[1].load(Ordering::Relaxed));
@@ -420,7 +448,9 @@ pub mod cpal_out {
 
         let mk = |prod| Pusher {
             prod: Arc::new(Mutex::new(prod)),
-            target: (sample_rate as usize * 2 * 30 / 1000).max(2), // ~30 ms de rétention max
+            // Rétention visée quand on écrête (anneau presque plein, horloge carte plus lente) :
+            // au-dessus du pré-tampon (90 ms) pour ne pas re-déclencher de sous-alimentation.
+            target: (sample_rate as usize * 2 * 150 / 1000).max(2),
             capacity: cap,
             channels: 2,
         };
