@@ -191,13 +191,15 @@ disponibles dans `GET /api/state`.
 - Un seul téléphone simultané (le canal « phone » est unique) ; plusieurs sources = plusieurs canaux à ajouter.
 - Les fichiers vidéo sont décodés par GStreamer et envoyés au GPU image par image (suffisant pour des overlays 1080p).
 - Pas d'enregistrement ni de streaming RTMP.
-- **Sortie multicanal via CoreAudio (macOS)** : l'élément `osxaudiosink` de GStreamer se limite
-  à 2 canaux de sortie même quand la carte en expose plus. `streame` contourne cela en ouvrant la
-  sortie directement en CoreAudio (via cpal) : le graphe GStreamer assemble le flux entrelacé à N
-  canaux (habillage + stream déjà routés, avec les VU-mètres) et un `appsink` le pousse dans le
-  flux CoreAudio. Le nombre de canaux est détecté automatiquement (8 sur la Wing). L'entrée
-  (retour vers le téléphone) reste lue par GStreamer, qui gère bien le multicanal en entrée.
-  Pour `output_device = "default"`, la sortie repasse par GStreamer (stéréo, suffisant).
+- **E/S carte via CoreAudio (macOS)** : `osxaudiosink` de GStreamer se limite à 2 canaux de
+  sortie, et ouvrir la même carte à la fois par cpal (sortie) et GStreamer (entrée) finissait par
+  la coincer. `streame` fait donc passer **toute l'E/S de la carte nommée par CoreAudio (cpal)** :
+  la sortie (N canaux, détectés automatiquement, 8 sur la Wing) via un `appsink`, et l'entrée
+  (retour vers le téléphone) via un flux d'entrée cpal → `appsrc`. GStreamer garde le mixage, le
+  routage, les VU-mètres et les codecs, mais ne touche plus le périphérique — un seul framework
+  possède la carte. Les flux sont fermés proprement à l'arrêt (Ctrl-C / fermeture) pour ne pas
+  laisser la carte USB dans un état bloqué. Pour `output_device`/`input_device = "default"`, on
+  repasse par GStreamer (stéréo).
 - Le retour audio vers le téléphone est stéréo 48 kHz Opus ; l'annulation d'écho est faite côté téléphone.
 - Sur Chrome/Android, forcer `video_codec = "VP8"` si le H264 matériel n'est pas disponible.
 - La négociation active l'extension d'en-tête RTP *transport-wide-cc* : sans elle, l'estimation

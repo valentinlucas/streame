@@ -193,7 +193,7 @@ pub mod cpal_out {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use ringbuf::traits::{Consumer, Observer, Producer, Split};
     use ringbuf::HeapRb;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tracing::{error, info, warn};
 
@@ -354,5 +354,132 @@ pub mod cpal_out {
             }
             let _ = prod.push_slice(samples);
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // ENTRÉE CoreAudio (retour de la carte vers le téléphone)
+    // ------------------------------------------------------------------------------------------
+
+    type Cons = ringbuf::HeapCons<f32>;
+
+    /// Lecteur du retour (côté appsrc GStreamer). Le producteur est le thread temps réel
+    /// d'entrée CoreAudio, sans verrou ; ici on lit sous verrou (thread GStreamer, non temps réel).
+    #[derive(Clone)]
+    pub struct Reader {
+        cons: Arc<Mutex<Cons>>,
+    }
+
+    impl Reader {
+        /// Remplit `out` (F32 stéréo entrelacé) avec le retour disponible ; renvoie le nombre
+        /// d'échantillons fournis (le reste est à compléter en silence par l'appelant).
+        pub fn pull(&self, out: &mut [f32]) -> usize {
+            match self.cons.lock() {
+                Ok(mut c) => c.pop_slice(out),
+                Err(_) => 0,
+            }
+        }
+    }
+
+    fn find_input_device(name: &str) -> Result<cpal::Device> {
+        let host = cpal::default_host();
+        let low = name.to_lowercase();
+        host.input_devices()?
+            .find(|d| {
+                d.name()
+                    .map(|n| n.to_lowercase().contains(&low))
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| anyhow!("périphérique d'entrée CoreAudio « {name} » introuvable"))
+    }
+
+    /// Meilleure configuration d'entrée (canaux max, 48 kHz si possible).
+    pub fn best_input_config(name: &str) -> Result<(u16, u32)> {
+        let dev = find_input_device(name)?;
+        let def = dev.default_input_config()?;
+        let mut best = (def.channels(), def.sample_rate().0);
+        if let Ok(cfgs) = dev.supported_input_configs() {
+            for c in cfgs {
+                if c.channels() >= best.0 {
+                    let rate = if c.min_sample_rate().0 <= 48000 && 48000 <= c.max_sample_rate().0 {
+                        48000
+                    } else {
+                        c.max_sample_rate().0
+                    };
+                    best = (c.channels(), rate);
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// Ouvre le flux d'ENTRÉE CoreAudio. Le callback temps réel sélectionne les 2 canaux de
+    /// retour (indices 0-based dans `sel`, modifiables à chaud) et pousse du stéréo dans le tampon.
+    pub fn start_input(
+        name: &str,
+        in_channels: u16,
+        sample_rate: u32,
+        sel: Arc<[AtomicUsize; 2]>,
+    ) -> Result<(Output, Reader)> {
+        let dev = find_input_device(name)?;
+        let config = cpal::StreamConfig {
+            channels: in_channels,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let in_ch = in_channels as usize;
+        let capacity = (sample_rate as usize * 2 * 400 / 1000).max(4); // stéréo, ~400 ms
+        let (mut prod, cons) = HeapRb::<f32>::new(capacity).split();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stop_thread, name_owned) = (stop.clone(), name.to_string());
+        let thread = std::thread::Builder::new()
+            .name("cpal-in".into())
+            .spawn(move || {
+                let stream = match dev.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        if in_ch == 0 {
+                            return;
+                        }
+                        let i0 = sel[0].load(Ordering::Relaxed).min(in_ch - 1);
+                        let i1 = sel[1].load(Ordering::Relaxed).min(in_ch - 1);
+                        let frames = data.len() / in_ch;
+                        for f in 0..frames {
+                            let base = f * in_ch;
+                            // Plein : on jette (le tampon reste borné, la latence aussi).
+                            if prod.try_push(data[base + i0]).is_err() {
+                                break;
+                            }
+                            let _ = prod.try_push(data[base + i1]);
+                        }
+                    },
+                    |e| error!("flux d'entrée CoreAudio : {e}"),
+                    None,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("création du flux d'entrée CoreAudio « {name_owned} » : {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = stream.play() {
+                    error!("démarrage du flux d'entrée CoreAudio : {e}");
+                    return;
+                }
+                info!(
+                    "entrée CoreAudio « {name_owned} » : {in_channels} canaux @ {sample_rate} Hz"
+                );
+                while !stop_thread.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_millis(250));
+                }
+            })?;
+        Ok((
+            Output {
+                stop,
+                thread: Some(thread),
+            },
+            Reader {
+                cons: Arc::new(Mutex::new(cons)),
+            },
+        ))
     }
 }

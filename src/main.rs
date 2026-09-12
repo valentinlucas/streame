@@ -121,6 +121,16 @@ fn main() -> Result<()> {
     engine.start()?;
     print_urls(&cfg, &ips);
 
+    // Ctrl-C : arrêt propre (ferme les flux CoreAudio, sinon la carte USB peut rester coincée).
+    {
+        let engine = engine.clone();
+        let _ = ctrlc::set_handler(move || {
+            info!("arrêt (Ctrl-C)");
+            engine.stop();
+            std::process::exit(0);
+        });
+    }
+
     if cli.no_window {
         info!("mode sans fenêtre : Ctrl-C pour quitter");
         let _ = server_thread.join();

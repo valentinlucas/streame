@@ -9,9 +9,11 @@
 //! uridecodebin (overlay.mp4) ─ appsink ─► FrameSlot(vidéo) ─┼─► rendu wgpu/Metal ─► HDMI + multiview
 //! PNG / texte (décodés au démarrage) ────────────────────────┘
 //! pipeline WebRTC ─ décode audio ─ appsink ─► appsrc(leaky) ─ mix-matrix ─┐
-//! habillage (vidéos) ─ mix-matrix ─────────────────────────────────────────┼─► audiomixer ─► CoreAudio (Wing)
-//! carte son (Wing) ─ audioconvert(mix-matrix) ─► interaudiosink(return) ─► téléphone
+//! habillage (vidéos) ─ mix-matrix ─────────────────────────────────────────┼─► audiomixer ─► appsink ─► CoreAudio out (Wing)
+//! CoreAudio in (Wing) ─► appsrc ─► interaudiosink(return) ─► pipeline WebRTC ─► opus ─► téléphone
 //! ```
+//! Toute l'E/S de la carte passe par CoreAudio (cpal) : GStreamer ne touche plus le
+//! périphérique, ce qui évite le conflit à deux frameworks qui coinçait la Wing.
 
 use crate::audio;
 use crate::config::{parse_color, Config, Geometry, LayerConfig};
@@ -129,6 +131,8 @@ struct AudioCtl {
     stream_conv: Option<gst::Element>,
     branding_conv: Option<gst::Element>,
     return_conv: Option<gst::Element>,
+    /// Sélection des 2 canaux de retour quand l'entrée passe par CoreAudio (indices 0-based).
+    return_sel: Option<Arc<[std::sync::atomic::AtomicUsize; 2]>>,
     out_channels: i32,
     in_channels: i32,
 }
@@ -778,35 +782,112 @@ impl Engine {
         }
 
         // ----- Retour de la carte son → téléphone -----
-        if let Some((src, in_ch)) =
-            audio::make_device_element(&a.input_device, audio::Direction::Source, a.input_channels)?
+        // Sur macOS avec une carte nommée, l'entrée passe aussi par CoreAudio (cpal) : la même
+        // carte n'est ainsi ouverte que par un seul framework (plus de conflit avec osxaudiosrc).
+        let sel_in = a.input_device.trim();
+        let mut return_done = false;
+        #[cfg(target_os = "macos")]
+        if !sel_in.is_empty()
+            && !sel_in.eq_ignore_ascii_case("none")
+            && !sel_in.eq_ignore_ascii_case("default")
         {
-            ctl.in_channels = in_ch;
-            route.in_channels = in_ch;
-            let cf0 = capsfilter(
-                &gst::Caps::builder("audio/x-raw")
-                    .field("channels", in_ch)
-                    .build(),
-            )?;
-            let matrix = audio::select_matrix(in_ch as usize, 2, &a.return_from_input_channels);
-            let conv = gst::ElementFactory::make("audioconvert")
-                .property("mix-matrix", audio::to_gst_matrix(&matrix))
-                .build()?;
-            let cf1 = capsfilter(&audio::raw_caps(rate, 2))?;
-            let level = level_element("level_return", a.meters)?;
-            let r1 = make("audioresample")?;
-            let q = audio_queue()?;
-            let sink = gst::ElementFactory::make("interaudiosink")
-                .property("channel", RETURN_AUDIO_CHANNEL)
-                .build()?;
-            pipeline.add_many([&src, &cf0, &conv, &cf1, &level, &r1, &q, &sink])?;
-            link_many(&[&src, &cf0, &conv, &cf1, &level, &r1, &q, &sink])?;
-            ctl.return_conv = Some(conv);
-            meters.push(("return".to_string(), "Retour Wing".to_string()));
-            info!(
-                "audio retour « {} » ({} canaux) : entrées {:?} → téléphone",
-                a.input_device, in_ch, a.return_from_input_channels
-            );
+            match audio::cpal_out::best_input_config(sel_in) {
+                Ok((in_ch, _in_rate)) => {
+                    use std::sync::atomic::AtomicUsize;
+                    let ch0 = a.return_from_input_channels.first().copied().unwrap_or(1);
+                    let ch1 = a.return_from_input_channels.get(1).copied().unwrap_or(ch0);
+                    let sel = Arc::new([
+                        AtomicUsize::new(ch0.saturating_sub(1)),
+                        AtomicUsize::new(ch1.saturating_sub(1)),
+                    ]);
+                    match audio::cpal_out::start_input(sel_in, in_ch, rate as u32, sel.clone()) {
+                        Ok((input, reader)) => {
+                            let caps = gst::Caps::builder("audio/x-raw")
+                                .field("format", "F32LE")
+                                .field("layout", "interleaved")
+                                .field("rate", rate)
+                                .field("channels", 2i32)
+                                .build();
+                            let appsrc = gst_app::AppSrc::builder()
+                                .caps(&caps)
+                                .is_live(true)
+                                .format(gst::Format::Time)
+                                .do_timestamp(true)
+                                .min_latency(0)
+                                .max_latency(150_000_000)
+                                .leaky_type(gst_app::AppLeakyType::Downstream)
+                                .max_time(gst::ClockTime::from_mseconds(150))
+                                .build();
+                            let chunk = (rate as usize / 100).max(1); // 10 ms de trames stéréo
+                            appsrc.set_callbacks(
+                                gst_app::AppSrcCallbacks::builder()
+                                    .need_data(move |src, _| {
+                                        let mut buf = vec![0f32; chunk * 2];
+                                        reader.pull(&mut buf); // le reste non fourni reste silence
+                                        let bytes: Vec<u8> = bytemuck::cast_slice(&buf).to_vec();
+                                        let _ = src.push_buffer(gst::Buffer::from_mut_slice(bytes));
+                                    })
+                                    .build(),
+                            );
+                            let level = level_element("level_return", a.meters)?;
+                            let sink = gst::ElementFactory::make("interaudiosink")
+                                .property("channel", RETURN_AUDIO_CHANNEL)
+                                .build()?;
+                            pipeline.add_many([appsrc.upcast_ref(), &level, &sink])?;
+                            link_many(&[appsrc.upcast_ref(), &level, &sink])?;
+                            ctl.in_channels = in_ch as i32;
+                            ctl.return_sel = Some(sel);
+                            route.in_channels = in_ch as i32;
+                            keepalives.push(Box::new(input));
+                            meters.push(("return".to_string(), "Retour Wing".to_string()));
+                            info!(
+                                "audio retour « {sel_in} » via CoreAudio : {in_ch} canaux, entrées {:?}",
+                                a.return_from_input_channels
+                            );
+                            return_done = true;
+                        }
+                        Err(e) => warn!(
+                            "entrée CoreAudio « {sel_in} » indisponible ({e:#}) ; repli GStreamer"
+                        ),
+                    }
+                }
+                Err(e) => warn!("entrée CoreAudio « {sel_in} » : {e:#} ; repli GStreamer"),
+            }
+        }
+
+        if !return_done {
+            if let Some((src, in_ch)) = audio::make_device_element(
+                &a.input_device,
+                audio::Direction::Source,
+                a.input_channels,
+            )? {
+                ctl.in_channels = in_ch;
+                route.in_channels = in_ch;
+                let cf0 = capsfilter(
+                    &gst::Caps::builder("audio/x-raw")
+                        .field("channels", in_ch)
+                        .build(),
+                )?;
+                let matrix = audio::select_matrix(in_ch as usize, 2, &a.return_from_input_channels);
+                let conv = gst::ElementFactory::make("audioconvert")
+                    .property("mix-matrix", audio::to_gst_matrix(&matrix))
+                    .build()?;
+                let cf1 = capsfilter(&audio::raw_caps(rate, 2))?;
+                let level = level_element("level_return", a.meters)?;
+                let r1 = make("audioresample")?;
+                let q = audio_queue()?;
+                let sink = gst::ElementFactory::make("interaudiosink")
+                    .property("channel", RETURN_AUDIO_CHANNEL)
+                    .build()?;
+                pipeline.add_many([&src, &cf0, &conv, &cf1, &level, &r1, &q, &sink])?;
+                link_many(&[&src, &cf0, &conv, &cf1, &level, &r1, &q, &sink])?;
+                ctl.return_conv = Some(conv);
+                meters.push(("return".to_string(), "Retour Wing".to_string()));
+                info!(
+                    "audio retour « {} » ({} canaux) : entrées {:?} → téléphone",
+                    a.input_device, in_ch, a.return_from_input_channels
+                );
+            }
         }
 
         Ok((
@@ -915,6 +996,19 @@ impl Engine {
     /// Change à chaud les canaux d'une source audio (mix-matrix de l'`audioconvert`).
     pub fn set_audio_route(&self, target: &str, channels: &[usize]) -> bool {
         let ctl = &self.audio_ctl;
+        // Retour via CoreAudio : la sélection se fait par atomics dans le callback d'entrée.
+        if target == "return" {
+            if let Some(sel) = &ctl.return_sel {
+                use std::sync::atomic::Ordering;
+                let c0 = channels.first().copied().unwrap_or(1);
+                let c1 = channels.get(1).copied().unwrap_or(c0);
+                sel[0].store(c0.saturating_sub(1), Ordering::Relaxed);
+                sel[1].store(c1.saturating_sub(1), Ordering::Relaxed);
+                self.route.lock().unwrap().return_input = channels.to_vec();
+                info!("audio : return re-routé vers {channels:?}");
+                return true;
+            }
+        }
         let (conv, matrix) = match target {
             "stream" => (
                 ctl.stream_conv.clone(),
@@ -1055,6 +1149,9 @@ impl Engine {
         if let Some(bus) = self.pipeline.bus() {
             bus.set_flushing(true);
         }
+        // Ferme proprement les flux CoreAudio (sinon une carte USB peut rester coincée
+        // jusqu'au rebranchement). Le Drop des objets arrête les flux et joint les threads.
+        self._audio_keepalive.lock().unwrap().clear();
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
