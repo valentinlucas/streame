@@ -246,6 +246,16 @@ disponibles dans `GET /api/state`.
   horloge calée sur le Mac. Filmer cette page avec le téléphone : l'écart entre l'heure dans
   l'image décodée et celle du bandeau = latence verre à verre. CoreAudio est ouvert avec un
   tampon de 256 trames (~5 ms) quand la carte l'annonce.
+- **Robustesse / non-blocage** : deux runtimes Tokio — `server` (HTTPS, WebSocket, signaling) et
+  `media` (webrtc-rs, boucles RTP, Opus, décodage) — pour qu'une charge ou un blocage média ne
+  rende jamais la page inaccessible. Les arrêts GStreamer (`set_state(Null)`, bloquants) se font
+  sur un thread dédié, jamais sur un worker. Un chien de garde journalise tout retard de réveil
+  d'un runtime (`runtime … : réveil en retard`) : c'est le signal à chercher si le serveur
+  « ne répond plus ». Les WebSocket sont pingés toutes les 15 s. Sur un échec ICE, le Mac
+  **relance l'ICE** (nouvelle offre `ice_restart`, pistes et décodeurs conservés, la page répond
+  sur la même RTCPeerConnection) — deux tentatives avec 15 s de grâce — au lieu de détruire la
+  session ; les états ICE/WebRTC et les erreurs de candidats sont journalisés pour diagnostiquer
+  les déconnexions.
 
 ## Tests
 
