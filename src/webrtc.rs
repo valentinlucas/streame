@@ -29,10 +29,13 @@ use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::{JitterBufferBuilder, Registry, Slot};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
-use rtc::peer_connection::configuration::media_engine::MIME_TYPE_OPUS;
+use rtc::peer_connection::configuration::media_engine::{
+    MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9,
+};
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 use rtc::shared::marshal::{Marshal, MarshalSize};
@@ -284,27 +287,49 @@ impl PeerConnectionEventHandler for Handler {
         // Sans cette rafale initiale, si la 1re image-clé arrive avant que decodebin ne soit prêt,
         // rtph264depay attend la suivante et l'image met longtemps (ou ne vient pas) — d'où les
         // démarrages « sans image » qu'on ne récupérait qu'en relançant le stream.
+        // Ensuite, plus de PLI périodique : chaque PLI force une image-clé (grosse, qualité en
+        // dents de scie). Un chien de garde n'en redemande que si les images cessent d'arriver
+        // (perte non rattrapée par NACK, encodeur relancé côté téléphone…).
         if let Some(pli_track) = pli_track {
             let cancel = self.cancel.clone();
+            let engine = self.engine.clone();
             tokio::spawn(async move {
-                let mut n = 0u32;
-                loop {
+                let send_pli = |t: Arc<dyn TrackRemote>| async move {
                     let pli = PictureLossIndication {
                         sender_ssrc: 0,
                         media_ssrc,
                     };
-                    if pli_track.write_rtcp(vec![Box::new(pli)]).await.is_err() {
-                        break;
+                    t.write_rtcp(vec![Box::new(pli)]).await.is_ok()
+                };
+                // Rafale de démarrage.
+                for _ in 0..6 {
+                    if !send_pli(pli_track.clone()).await {
+                        return;
                     }
-                    n += 1;
-                    let wait = if n < 6 {
-                        Duration::from_millis(400)
-                    } else {
-                        Duration::from_secs(3)
-                    };
                     tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(wait) => {}
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(400)) => {}
+                    }
+                }
+                // Chien de garde : image-clé uniquement si le décodeur est à sec depuis > 2 s.
+                let mut starved_since: Option<Instant> = None;
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                    let flowing = engine.phone_slot().fps.value() > 0.0;
+                    if flowing {
+                        starved_since = None;
+                        continue;
+                    }
+                    let since = *starved_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(2) {
+                        warn!("vidéo : plus d'images décodées depuis 2 s, demande d'image-clé (PLI)");
+                        if !send_pli(pli_track.clone()).await {
+                            return;
+                        }
+                        starved_since = Some(Instant::now()); // au plus un PLI toutes les 2 s
                     }
                 }
             });
@@ -420,15 +445,24 @@ impl PhoneSession {
             .await
             .context("ajout de la piste audio de retour")?;
         // Vidéo en réception seule.
-        pc.add_transceiver_from_kind(
-            RtpCodecKind::Video,
-            Some(RTCRtpTransceiverInit {
-                direction: RTCRtpTransceiverDirection::Recvonly,
-                ..Default::default()
-            }),
-        )
-        .await
-        .context("transceiver vidéo")?;
+        let video_tr = pc
+            .add_transceiver_from_kind(
+                RtpCodecKind::Video,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .context("transceiver vidéo")?;
+        // Ordre de préférence des codecs dans l'offre : par défaut webrtc-rs liste VP8 en premier
+        // et un navigateur qui respecte l'ordre (Brave/Chrome, Safari) encode alors en VP8 —
+        // logiciel sur iPhone, et pas de vtdec côté Mac. On met le codec configuré (H264 : encodage
+        // matériel sur le téléphone, décodage matériel VideoToolbox ici) en tête.
+        let prefs = video_codec_preferences(&cfg.server.video_codec);
+        if let Err(e) = video_tr.set_codec_preferences(prefs).await {
+            warn!("préférence de codec vidéo refusée ({e}) : ordre par défaut de webrtc-rs");
+        }
 
         // Son de retour → téléphone. macOS : encodage Opus direct (libopus) depuis l'entrée
         // carte (cpal), sans GStreamer. Ailleurs : pipeline GStreamer (interaudiosrc → opusenc).
@@ -565,6 +599,58 @@ fn spawn_bus_watch(pipeline: &gst::Pipeline, name: String) {
                 }
             }
         });
+}
+
+/// Liste ordonnée des codecs vidéo à offrir, le codec configuré en tête. Les paramètres
+/// (fmtp, types de charge utile) reprennent ceux enregistrés par `register_default_codecs`,
+/// sinon la préférence est refusée. Variantes H264 en `packetization-mode=1` (celle des iPhone)
+/// d'abord ; VP8/VP9 gardés en repli pour un navigateur sans H264 (Chromium de test, par ex.).
+fn video_codec_preferences(preferred: &str) -> Vec<RTCRtpCodecParameters> {
+    let fb = || {
+        vec![
+            RTCPFeedback { typ: "goog-remb".into(), parameter: String::new() },
+            RTCPFeedback { typ: "ccm".into(), parameter: "fir".into() },
+            RTCPFeedback { typ: "nack".into(), parameter: String::new() },
+            RTCPFeedback { typ: "nack".into(), parameter: "pli".into() },
+            RTCPFeedback { typ: "transport-cc".into(), parameter: String::new() },
+        ]
+    };
+    let codec = |mime: &str, fmtp: &str, pt: u8| RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: mime.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: fmtp.to_owned(),
+            rtcp_feedback: fb(),
+        },
+        payload_type: pt,
+    };
+    let h264 = [
+        codec(MIME_TYPE_H264, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", 125),
+        codec(MIME_TYPE_H264, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f", 102),
+        codec(MIME_TYPE_H264, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032", 123),
+    ];
+    let vp8 = [codec(MIME_TYPE_VP8, "", 96)];
+    let vp9 = [codec(MIME_TYPE_VP9, "profile-id=0", 98)];
+    let mut out = Vec::new();
+    match preferred.to_ascii_uppercase().as_str() {
+        "VP8" => {
+            out.extend(vp8);
+            out.extend(h264);
+            out.extend(vp9);
+        }
+        "VP9" => {
+            out.extend(vp9);
+            out.extend(h264);
+            out.extend(vp8);
+        }
+        _ => {
+            out.extend(h264);
+            out.extend(vp8);
+            out.extend(vp9);
+        }
+    }
+    out
 }
 
 /// `(media, encoding-name)` GStreamer pour un type MIME webrtc-rs (ex. « video/h264 »).
@@ -841,6 +927,13 @@ fn spawn_opus_decode(track: Arc<dyn TrackRemote>, engine: Arc<Engine>, cancel: C
         };
         let mut pcm = vec![0f32; 5760 * 2]; // jusqu'à 120 ms stéréo @ 48 kHz
         let mut started = false;
+        // Dissimulation des pertes : on suit les numéros de séquence ; sur un trou de 1 à 3
+        // paquets, les trames manquantes sont reconstituées par PLC (extrapolation libopus) et
+        // la dernière par le FEC en bande du paquet suivant quand le téléphone l'envoie
+        // (useinbandfec=1 négocié). Sans ça, chaque paquet perdu = un trou audible.
+        let mut last_seq: Option<u16> = None;
+        let mut last_per_ch: usize = 960; // taille de la dernière trame (20 ms par défaut)
+        let mut concealed: u64 = 0;
         loop {
             let evt = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -849,8 +942,34 @@ fn spawn_opus_decode(track: Arc<dyn TrackRemote>, engine: Arc<Engine>, cancel: C
             let Some(evt) = evt else { break };
             match evt {
                 TrackRemoteEvent::OnRtpPacket(pkt) => {
-                    match dec.decode_float(pkt.payload.as_ref(), &mut pcm, false) {
+                    let seq = pkt.header.sequence_number;
+                    let payload = pkt.payload.as_ref();
+                    if let Some(prev) = last_seq {
+                        let delta = seq.wrapping_sub(prev) as i16;
+                        if delta <= 0 {
+                            continue; // doublon ou paquet en retard déjà dissimulé
+                        }
+                        let lost = (delta - 1) as usize;
+                        if (1..=3).contains(&lost) {
+                            let fs = last_per_ch * 2;
+                            for _ in 1..lost {
+                                if let Ok(n) = dec.decode_float(&[], &mut pcm[..fs], false) {
+                                    engine.push_phone_audio_f32(&pcm[..n * 2]);
+                                }
+                            }
+                            if let Ok(n) = dec.decode_float(payload, &mut pcm[..fs], true) {
+                                engine.push_phone_audio_f32(&pcm[..n * 2]);
+                            }
+                            concealed += lost as u64;
+                            if concealed % 50 < lost as u64 {
+                                debug!("audio téléphone : {concealed} trames dissimulées (PLC/FEC)");
+                            }
+                        }
+                    }
+                    last_seq = Some(seq);
+                    match dec.decode_float(payload, &mut pcm, false) {
                         Ok(per_ch) => {
+                            last_per_ch = per_ch.max(1);
                             engine.push_phone_audio_f32(&pcm[..per_ch * 2]);
                             if !started {
                                 info!("audio téléphone : décodage Opus (libopus) démarré");
@@ -891,19 +1010,30 @@ fn spawn_opus_return(
                 }
             };
         let _ = enc.set_bitrate(opus::Bitrate::Bits(bitrate));
+        // FEC en bande : chaque paquet emporte une version basse qualité du précédent, le
+        // téléphone récupère ainsi un paquet perdu isolé sans attendre de retransmission.
+        let _ = enc.set_inband_fec(true);
+        let _ = enc.set_packet_loss_perc(10);
+        let _ = enc.set_dtx(false);
         let frame = 960 * 2; // 20 ms stéréo @ 48 kHz
         let mut pcm = vec![0f32; frame];
         let mut out = vec![0u8; 4000];
-        let mut tick = tokio::time::interval(Duration::from_millis(20));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        info!("retour audio : encodage Opus (libopus) démarré");
+        info!("retour audio : encodage Opus (libopus) démarré, cadencé par la carte");
+        // Cadencé par la CARTE, pas par une horloge murale : on encode une trame dès que
+        // 20 ms ont été capturées. Une seule horloge sur ce chemin → aucune dérive à compenser,
+        // les timestamps RTP suivent exactement la capture ; le jitter buffer du téléphone
+        // absorbe le réseau. Latence ≈ 1 trame + ~3 ms de scrutation.
         loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tick.tick() => {}
+            if cancel.is_cancelled() {
+                break;
             }
-            pcm.iter_mut().for_each(|s| *s = 0.0);
-            reader.pull(&mut pcm); // pré-tamponné ; complète en silence si sous-alimenté
+            if !reader.pull_frame(&mut pcm) {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(3)) => {}
+                }
+                continue;
+            }
             match enc.encode_float(&pcm, &mut out) {
                 Ok(len) if len > 0 => {
                     let sample = Sample {

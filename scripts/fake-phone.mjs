@@ -3,9 +3,9 @@
 // même parcours que l'appareil réel (getUserMedia + WebRTC via web/app.js).
 //
 // Prérequis : node + `npm i playwright` (utilise le Chromium déjà mis en cache par Playwright).
-// Chromium n'a pas d'encodeur H264 : la négociation retombe sur VP8 (le vrai iPhone, lui, envoie
-// du H264). decodebin décode les deux ; c'est surtout utile pour tester l'ICE, le signaling, le
-// jitter buffer et la reconnexion.
+// L'offre de streame met H264 en tête : Chromium négocie donc en H264 (encodeur logiciel), le
+// même chemin H264 → vtdec que l'iPhone. Utile pour tester l'ICE, le signaling, le jitter buffer,
+// la reconnexion et le décodage — pas la qualité sonore (à juger à l'oreille sur un vrai appareil).
 //
 // Usage :
 //   URL=https://127.0.0.1:8444/  ITER=3  HOLD=8000  HEADLESS=1  node scripts/fake-phone.mjs

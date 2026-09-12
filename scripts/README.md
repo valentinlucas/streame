@@ -7,9 +7,9 @@ streame, en suivant le même parcours que l'appareil réel (getUserMedia + WebRT
 Pratique pour reproduire les problèmes d'ICE, de signaling, de jitter buffer et de reconnexion
 sans matériel, en boucle.
 
-> Chromium n'embarque pas d'encodeur **H264** : la négociation retombe sur **VP8** (le vrai iPhone,
-> lui, envoie du H264). `decodebin` décode les deux ; garder ça en tête si on teste spécifiquement
-> le chemin H264.
+> Depuis que l'offre met H264 en tête, Chromium négocie lui aussi en **H264** (encodeur logiciel) :
+> le banc exerce donc le même chemin H264 → `vtdec` que l'iPhone. Mettre `video_codec = "VP8"`
+> dans la config de test pour exercer le chemin VP8.
 
 ### Installation (une fois)
 

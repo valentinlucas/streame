@@ -173,12 +173,12 @@ Les fichiers vidéo avec couche alpha (ProRes 4444, WebM VP9 alpha…) sont comp
 | `src/engine.rs` | État de la régie (scènes, programme, preview, transitions), chargement des calques (PNG, texte, fichiers vidéo via `uridecodebin` → `appsink` en boucle), routage audio (`audioconvert mix-matrix`). |
 | `src/render.rs` | Rendu wgpu : chaque scène dans une texture hors écran, fondu programme, tuiles/cadres/libellés du multiview, conversion NV12 → RGB dans le shader. |
 | `src/frame.rs` | Emplacements d'images partagés entre GStreamer et le rendu (dernière image + compteur i/s). |
-| `src/webrtc.rs` | Une session **webrtc-rs** par téléphone (le Mac fait l'offre) : ICE/DTLS/SRTP/RTP, jitter buffer et TWCC/NACK gérés en Rust. Les paquets RTP entrants sont poussés dans un `appsrc` → `decodebin` (vtdec vers le GPU, opusdec vers cpal) ; le retour audio est encodé en Opus (`opusenc`) et écrit sur une piste locale. |
+| `src/webrtc.rs` | Une session **webrtc-rs** par téléphone (le Mac fait l'offre, H264 en tête des codecs) : ICE/DTLS/SRTP/RTP, jitter buffer et TWCC/NACK en Rust. Vidéo : RTP → `appsrc` → `decodebin` (vtdec) → GPU, un pipeline isolé par piste. Audio : décodage Opus par **libopus** (PLC/FEC) → mixeur cpal ; retour encodé par libopus au rythme de la carte, écrit sur la piste locale. Image-clé demandée par rafale au démarrage puis seulement si les images cessent. |
 | `src/server.rs` | Serveur HTTPS axum : page téléphone, WebSocket de signaling, page/WebSocket de contrôle, API REST (avec statistiques). |
 | `src/ui.rs` | Fenêtres winit : programme (plein écran sur l'écran choisi) et multiview (clics, clavier), rendu cadencé sur la fréquence de l'écran. |
 | `src/streamdeck.rs` | Thread Stream Deck (hidapi) : rendu des touches, actions, reconnexion. |
 | `src/text.rs` | Rendu de texte (police DejaVu embarquée) pour les libellés et les touches. |
-| `src/audio.rs` | Énumération des périphériques (GstDeviceMonitor), matrices de routage. |
+| `src/audio.rs` | Énumération des périphériques, matrices de routage ; sur macOS l'E/S CoreAudio (cpal) : mixage/routage/VU-mètres dans le callback temps réel, pré-tampon et **compensation de dérive d'horloge** (ré-échantillonnage asservi au remplissage de l'anneau). |
 | `src/config.rs` | Modèle de configuration TOML. |
 | `web/` | Pages téléphone et contrôle (embarquées dans le binaire). |
 
@@ -196,12 +196,17 @@ disponibles dans `GET /api/state`.
   Le mixage des deux sources (stream du téléphone et habillage), leur routage sur les canaux
   choisis et les VU-mètres sont calculés directement dans le callback temps réel de la carte, à
   son horloge exacte — pas de mélangeur GStreamer, une seule horloge, synchro et latence
-  minimales. GStreamer ne fait plus que décoder (WebRTC, fichiers d'habillage) et coder (Opus du
-  retour) ; il ne touche plus le périphérique, ce qui supprime le conflit à deux frameworks qui
-  coinçait la Wing. La sortie ouvre autant de canaux que la carte en expose (8 sur la Wing),
-  l'entrée alimente le retour vers le téléphone. Les flux sont fermés proprement à l'arrêt
-  (Ctrl-C, fermeture) pour ne pas laisser la carte USB bloquée. Hors macOS, c'est GStreamer qui
-  fait le mixage et l'E/S.
+  minimales. **L'audio ne passe plus du tout par GStreamer** : le son du téléphone est décodé par
+  libopus (avec dissimulation de pertes PLC/FEC) et poussé dans le mixeur, le retour est capturé
+  par cpal et encodé par libopus au rythme de la carte (une seule horloge sur ce chemin, FEC en
+  bande activé). GStreamer ne sert plus qu'au décodage vidéo et aux fichiers d'habillage ; il ne
+  touche plus le périphérique, ce qui supprime le conflit à deux frameworks qui coinçait la Wing.
+  Côté sortie, la source (réseau) et la carte ont deux horloges 48 kHz indépendantes : un
+  ré-échantillonneur asservi au remplissage de l'anneau (cible ~70 ms, ±0,5 % max) compense la
+  dérive en douceur, sans saut de trames ni coupure. La sortie ouvre autant de canaux que la
+  carte en expose (8 sur la Wing), l'entrée alimente le retour vers le téléphone. Les flux sont
+  fermés proprement à l'arrêt (Ctrl-C, fermeture) pour ne pas laisser la carte USB bloquée. Hors
+  macOS, c'est GStreamer qui fait le mixage, les codecs audio et l'E/S.
 - Le retour audio vers le téléphone est stéréo 48 kHz Opus ; l'annulation d'écho est faite côté téléphone.
 - Sur Chrome/Android, forcer `video_codec = "VP8"` si le H264 matériel n'est pas disponible.
 - **Transport WebRTC via webrtc-rs** (v0.21) : `register_default_interceptors` active NACK, les
@@ -211,6 +216,15 @@ disponibles dans `GET /api/state`.
   adaptatif de webrtc-rs lisse le flux entrant (profondeur = `rtc_latency_ms`) avant le décodage.
   Le débit maximal est fixé côté téléphone (`web/app.js`) selon la résolution (8 Mb/s en 1080p).
   Le mode mDNS *QueryOnly* résout les candidats `.local` d'iOS/Safari pour l'ICE sur le LAN.
+- **Ordre des codecs** : webrtc-rs offre VP8 en premier par défaut, et les navigateurs suivent
+  l'ordre de l'offre — un iPhone encodait alors en VP8 (logiciel), sans décodage matériel côté
+  Mac. L'offre met désormais le codec de `video_codec` en tête (H264 par défaut : encodage
+  matériel sur le téléphone, VideoToolbox ici), VP8/VP9 en repli.
+- **Sortie audio du téléphone** : la page propose la sortie du retour (`setSinkId`) là où le
+  navigateur le permet (Chrome/Brave/Edge/Firefox, Android, desktop). Sur iOS/WebKit la sortie
+  suit la route système : choisir les AirPods comme micro les fait devenir la route ; sinon,
+  Centre de contrôle. Le micro peut être changé pendant le direct (`replaceTrack`, sans
+  renégociation).
 
 ## Tests
 

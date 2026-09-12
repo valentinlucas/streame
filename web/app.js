@@ -60,6 +60,51 @@
       msel.appendChild(o);
     });
     if ([...msel.options].some((o) => o.value === mcur)) msel.value = mcur;
+
+    // Sorties audio (retour du Mac) : sélectionnables via setSinkId (Chrome/Brave/Edge/Firefox,
+    // desktop et Android). iOS/WebKit ne l'expose pas : la sortie suit la route système.
+    const ssel = $('sink');
+    if (!canPickSink()) {
+      ssel.hidden = true; $('sink-label').hidden = true; $('sink-hint').hidden = false;
+    } else {
+      const outs = devs.filter((d) => d.kind === 'audiooutput');
+      const scur = ssel.value;
+      ssel.innerHTML = '<option value="">Sortie par défaut</option>';
+      outs.forEach((d, i) => {
+        const o = document.createElement('option');
+        o.value = d.deviceId; o.textContent = d.label || `Sortie ${i + 1}`;
+        ssel.appendChild(o);
+      });
+      if ([...ssel.options].some((o) => o.value === scur)) ssel.value = scur;
+    }
+  }
+
+  function canPickSink() { return typeof HTMLMediaElement.prototype.setSinkId === 'function'; }
+
+  // Applique la sortie choisie à l'élément qui joue le retour du Mac.
+  async function applySink() {
+    if (!canPickSink()) return;
+    const id = $('sink').value;
+    try { await $('remote').setSinkId(id || ''); }
+    catch (e) { console.warn('setSinkId', e); setupStatus('Sortie audio indisponible : ' + (e.message || e)); }
+  }
+
+  // Changement de micro pendant le direct : nouvelle capture audio, puis on remplace la piste
+  // envoyée au Mac sans renégocier (replaceTrack). L'ancienne piste est arrêtée.
+  async function switchMic() {
+    if (!live || !stream || !pc) return;
+    let fresh;
+    try { fresh = await navigator.mediaDevices.getUserMedia({ audio: constraints().audio }); }
+    catch (e) { liveStatus('Micro indisponible : ' + (e.message || e)); return; }
+    const track = fresh.getAudioTracks()[0];
+    if (!track) return;
+    track.enabled = micOn;
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
+    if (sender) { try { await sender.replaceTrack(track); } catch (e) { console.warn('replaceTrack', e); } }
+    stream.getAudioTracks().forEach((t) => { t.stop(); stream.removeTrack(t); });
+    stream.addTrack(track);
+    localStorage.setItem('streame-mic', $('mic').value);
+    liveStatus('Micro : ' + (track.label || 'changé'));
   }
 
   // ---- Aperçu (écran de réglages) ---------------------------------------------------------
@@ -68,7 +113,16 @@
     setupStatus('Accès à la caméra…');
     try {
       if (stream) stream.getTracks().forEach((t) => t.stop());
-      stream = await navigator.mediaDevices.getUserMedia(constraints());
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints());
+      } catch (e) {
+        // Périphérique choisi disparu (AirPods rangés, objectif indisponible…) : on repart sur
+        // les périphériques par défaut plutôt que de bloquer l'écran de réglages.
+        if (!['OverconstrainedError', 'NotFoundError', 'NotReadableError'].includes(e.name)) throw e;
+        console.warn('[streame] périphérique indisponible, repli par défaut :', e.name);
+        $('mic').value = ''; $('camera').value = 'facing:environment';
+        stream = await navigator.mediaDevices.getUserMedia(constraints());
+      }
       stream.getVideoTracks().forEach((t) => { try { t.contentHint = 'motion'; } catch (e) { /* ignoré */ } });
     } catch (e) {
       stream = null;
@@ -91,6 +145,7 @@
     localStorage.setItem('streame-name', $('name').value);
     localStorage.setItem('streame-cam', $('camera').value);
     localStorage.setItem('streame-mic', $('mic').value);
+    localStorage.setItem('streame-sink', $('sink').value);
     localStorage.setItem('streame-q', $('quality').value);
 
     $('local').srcObject = stream;
@@ -99,6 +154,7 @@
     setOnAir(false);
     updateMuteButtons();
     $('remote').muted = false;
+    applySink();
     $('remote').play().catch(() => {});
     requestFullscreen(); // geste utilisateur : plein écran sur Android/desktop
     keepAwake();
@@ -260,7 +316,9 @@
   updateRotate();
 
   // ---- Divers -----------------------------------------------------------------------------
-  ['camera', 'mic', 'quality'].forEach((id) => { $(id).onchange = () => { if (!live) startPreview(); }; });
+  ['camera', 'quality'].forEach((id) => { $(id).onchange = () => { if (!live) startPreview(); }; });
+  $('mic').onchange = () => { if (live) switchMic(); else startPreview(); };
+  $('sink').onchange = () => { localStorage.setItem('streame-sink', $('sink').value); applySink(); };
   navigator.mediaDevices.addEventListener('devicechange', () => { if (!live) refreshDevices(); });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && live) keepAwake(); });
 
@@ -268,7 +326,7 @@
   if (localStorage.getItem('streame-cam')) $('camera').value = localStorage.getItem('streame-cam');
   if (localStorage.getItem('streame-q')) $('quality').value = localStorage.getItem('streame-q');
   startPreview().then(() => {
-    for (const [k, id] of [['streame-cam', 'camera'], ['streame-mic', 'mic']]) {
+    for (const [k, id] of [['streame-cam', 'camera'], ['streame-mic', 'mic'], ['streame-sink', 'sink']]) {
       const v = localStorage.getItem(k);
       if (v && [...$(id).options].some((o) => o.value === v)) $(id).value = v;
     }

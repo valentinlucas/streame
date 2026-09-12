@@ -210,6 +210,8 @@ pub mod cpal_out {
         target: usize,
         capacity: usize,
         channels: usize,
+        /// Compensation de dérive d'horloge (ré-échantillonnage asservi au remplissage).
+        asrc: Arc<Mutex<Asrc>>,
     }
 
     /// VU-mètre d'une source (2 canaux), mis à jour dans le callback temps réel (sans verrou).
@@ -357,10 +359,12 @@ pub mod cpal_out {
         let mut bbuf = vec![0f32; 8192 * 2];
         let meters_cb = meters.clone();
         let (sc, bc) = (stream_ch, branding_ch);
-        // Pré-tampon : on attend d'avoir accumulé ~90 ms avant de jouer une source, sinon la
+        // Pré-tampon : on attend d'avoir accumulé ~50 ms avant de jouer une source, sinon la
         // moindre gigue vide l'anneau et le callback comble avec du silence → son haché. En cas
         // de sous-alimentation on repasse en pré-tampon (une coupure nette plutôt qu'un hachis).
-        let prime = (sample_rate as usize * 2 * 90 / 1000).max(2);
+        // En régime établi, l'asservissement de dérive du `Pusher` maintient ~70 ms, donc on ne
+        // repasse jamais par ici.
+        let prime = (sample_rate as usize * 2 * 50 / 1000).max(2);
         let mut phone_primed = false;
         let mut brand_primed = false;
 
@@ -448,11 +452,13 @@ pub mod cpal_out {
 
         let mk = |prod| Pusher {
             prod: Arc::new(Mutex::new(prod)),
-            // Rétention visée quand on écrête (anneau presque plein, horloge carte plus lente) :
-            // au-dessus du pré-tampon (90 ms) pour ne pas re-déclencher de sous-alimentation.
-            target: (sample_rate as usize * 2 * 150 / 1000).max(2),
+            // Remplissage visé par l'asservissement de dérive (~70 ms) : au-dessus du pré-tampon
+            // du callback (50 ms) pour ne jamais re-déclencher de sous-alimentation en régime
+            // établi, assez bas pour rester à faible latence.
+            target: (sample_rate as usize * 2 * 70 / 1000).max(2),
             capacity: cap,
             channels: 2,
+            asrc: Arc::new(Mutex::new(Asrc::new())),
         };
         Ok((
             Output {
@@ -464,27 +470,104 @@ pub mod cpal_out {
         ))
     }
 
+    /// Écart maximal du rapport de ré-échantillonnage (±0,5 % : inaudible, et 25× la dérive
+    /// typique de deux quartz).
+    const MAX_DRIFT: f64 = 0.005;
+
+    /// Ré-échantillonnage asynchrone = compensation de dérive d'horloge. La source (réseau via
+    /// libopus, ou GStreamer pour l'habillage) et la carte tournent sur deux horloges 48 kHz
+    /// indépendantes : sans compensation, l'anneau se vide ou se remplit lentement, jusqu'à la
+    /// coupure ou au saut de trames. Ici le rapport de ré-échantillonnage est asservi en douceur
+    /// au remplissage de l'anneau (cible ~70 ms) : interpolation linéaire, rapport lissé et borné,
+    /// convergence en quelques secondes — c'est ce que font les moteurs audio WebRTC (NetEQ/ADM)
+    /// et les sinks GStreamer (« clock slaving »). À rapport exactement 1, la sortie est identique
+    /// à l'entrée (aucune perte de qualité en régime verrouillé).
+    struct Asrc {
+        /// Trames de sortie produites par trame d'entrée (≈ 1 ± MAX_DRIFT).
+        ratio: f64,
+        /// Position fractionnaire de lecture dans l'entrée virtuelle `[prev, x0, x1, …]`.
+        phase: f64,
+        /// Dernière trame d'entrée du bloc précédent (continuité de l'interpolation).
+        prev: [f32; 2],
+        started: bool,
+        /// Sortie ré-échantillonnée du bloc courant (réutilisée, pas d'allocation en régime).
+        buf: Vec<f32>,
+    }
+
+    impl Asrc {
+        fn new() -> Self {
+            Self {
+                ratio: 1.0,
+                phase: 1.0,
+                prev: [0.0; 2],
+                started: false,
+                buf: Vec::with_capacity(8192),
+            }
+        }
+
+        /// Asservit le rapport au remplissage : `err` = écart relatif à la cible (>0 : trop
+        /// plein, la carte consomme moins vite → produire moins ; <0 : l'inverse).
+        fn steer(&mut self, err: f64) {
+            let wanted = (1.0 - 0.01 * err).clamp(1.0 - MAX_DRIFT, 1.0 + MAX_DRIFT);
+            self.ratio += (wanted - self.ratio) * 0.05;
+        }
+
+        /// Ré-échantillonne un bloc stéréo entrelacé dans `self.buf`.
+        fn process(&mut self, x: &[f32]) -> &[f32] {
+            let n = x.len() / 2;
+            self.buf.clear();
+            if n == 0 {
+                return &self.buf;
+            }
+            if !self.started {
+                self.prev = [x[0], x[1]];
+                self.phase = 1.0;
+                self.started = true;
+            }
+            let step = 1.0 / self.ratio;
+            let frame = |i: usize| -> [f32; 2] {
+                if i == 0 {
+                    self.prev
+                } else {
+                    [x[(i - 1) * 2], x[(i - 1) * 2 + 1]]
+                }
+            };
+            let mut pos = self.phase;
+            while pos < n as f64 {
+                let i = pos as usize;
+                let frac = (pos - i as f64) as f32;
+                let (a, b) = (frame(i), frame(i + 1));
+                self.buf.push(a[0] + (b[0] - a[0]) * frac);
+                self.buf.push(a[1] + (b[1] - a[1]) * frac);
+                pos += step;
+            }
+            self.phase = pos - n as f64;
+            self.prev = [x[(n - 1) * 2], x[(n - 1) * 2 + 1]];
+            &self.buf
+        }
+    }
+
     impl Pusher {
-        /// Pousse des échantillons F32 entrelacés. Anti-dérive : si le tampon dépasse largement
-        /// la cible (l'horloge de la carte est un peu plus lente), on saute des trames récentes
-        /// pour ne pas laisser la latence grandir.
+        /// Pousse des échantillons F32 stéréo entrelacés, après compensation de dérive (voir
+        /// [`Asrc`]). Plafond dur en dernier recours (anneau quasi plein après un décrochage) :
+        /// on ne garde que la fin du bloc.
         pub fn push(&self, samples: &[f32]) {
-            let Ok(mut prod) = self.prod.lock() else {
+            let (Ok(mut prod), Ok(mut asrc)) = (self.prod.lock(), self.asrc.lock()) else {
                 return;
             };
             let occupied = prod.occupied_len();
-            // Plafond dur : au-delà de la capacité, on jette (évite le blocage).
-            if occupied >= self.capacity.saturating_sub(samples.len()) {
-                // Trop en retard : on saute presque tout sauf la cible, en gardant l'alignement
-                // sur les trames (multiples du nombre de canaux).
-                let keep = self.target - (self.target % self.channels.max(1));
-                let skip = samples.len().saturating_sub(keep.min(samples.len()));
-                let start = skip - (skip % self.channels.max(1));
-                let _ = prod.push_slice(&samples[start..]);
-                warn!("sortie CoreAudio : tampon plein, trames sautées (dérive d'horloge)");
+            let err = (occupied as f64 - self.target as f64) / self.target.max(1) as f64;
+            asrc.steer(err);
+            let out = asrc.process(samples);
+            let free = self.capacity.saturating_sub(prod.occupied_len());
+            if out.len() > free {
+                let ch = self.channels.max(1);
+                let start = (out.len() - free) - ((out.len() - free) % ch);
+                let _ = prod.push_slice(&out[start..]);
+                warn!("sortie CoreAudio : tampon plein, début de bloc sauté (décrochage)");
                 return;
             }
-            let _ = prod.push_slice(samples);
+            let _ = prod.push_slice(out);
         }
     }
 
@@ -499,32 +582,25 @@ pub mod cpal_out {
     #[derive(Clone)]
     pub struct Reader {
         cons: Arc<Mutex<Cons>>,
-        /// Pré-tampon : vrai une fois qu'on a accumulé assez d'échantillons pour jouer.
-        primed: Arc<AtomicBool>,
-        /// Seuil de pré-tampon (échantillons) avant de commencer / après une sous-alimentation.
-        prime: usize,
-        /// Au-delà, on jette les échantillons les plus anciens (anti-dérive : la carte va plus
-        /// vite que GStreamer) pour ne pas laisser la latence du retour grandir.
+        /// Au-delà, on jette les échantillons les plus anciens (le consommateur a décroché :
+        /// tâche d'encodage en retard, session absente) pour borner la latence du retour.
         drift_max: usize,
     }
 
     impl Reader {
-        /// Remplit `out` (F32 stéréo entrelacé) avec le retour disponible ; renvoie le nombre
-        /// d'échantillons réels fournis (le reste, laissé à zéro par l'appelant, est du silence).
-        ///
-        /// Pré-tamponné : tant qu'on n'a pas accumulé `prime` échantillons on ne joue rien (silence
-        /// propre), et une sous-alimentation repasse en pré-tampon — sinon la moindre gigue
-        /// entre l'horloge de la carte et celle de GStreamer donnait des trames moitié son /
-        /// moitié silence, d'où le son haché du retour vers le téléphone.
-        pub fn pull(&self, out: &mut [f32]) -> usize {
+        /// Extrait exactement une trame (`out.len()` échantillons F32 stéréo entrelacés) si elle
+        /// est disponible et renvoie `true` ; sinon ne touche pas `out` et renvoie `false`.
+        /// L'appelant encode donc au rythme exact de la carte (pas d'horloge murale, pas de
+        /// trames complétées en silence — c'était la cause du retour haché).
+        pub fn pull_frame(&self, out: &mut [f32]) -> bool {
             let Ok(mut c) = self.cons.lock() else {
-                return 0;
+                return false;
             };
-            // Anti-dérive : si le retard s'accumule, on saute les échantillons les plus anciens
-            // pour revenir au niveau du pré-tampon (garde la latence bornée).
+            // Si le consommateur a décroché, on saute le plus ancien pour repartir à ~2 trames.
             let occupied = c.occupied_len();
             if occupied > self.drift_max {
-                let mut skip = (occupied - self.prime) & !1; // aligné sur la trame stéréo
+                let keep = (out.len() * 2) & !1;
+                let mut skip = occupied.saturating_sub(keep) & !1;
                 let mut junk = [0f32; 1024];
                 while skip > 0 {
                     let n = junk.len().min(skip);
@@ -535,18 +611,10 @@ pub mod cpal_out {
                     skip -= got;
                 }
             }
-            if !self.primed.load(Ordering::Relaxed) {
-                if c.occupied_len() >= self.prime {
-                    self.primed.store(true, Ordering::Relaxed);
-                } else {
-                    return 0; // silence le temps de constituer le pré-tampon
-                }
+            if c.occupied_len() < out.len() {
+                return false;
             }
-            let n = c.pop_slice(out);
-            if n < out.len() {
-                self.primed.store(false, Ordering::Relaxed); // sous-alimentation → on re-tamponne
-            }
-            n
+            c.pop_slice(out) == out.len()
         }
     }
 
@@ -657,10 +725,7 @@ pub mod cpal_out {
                     std::thread::park_timeout(std::time::Duration::from_millis(250));
                 }
             })?;
-        // Pré-tampon ~60 ms : absorbe la gigue et la dérive entre l'horloge de la carte et celle
-        // de GStreamer côté retour (le téléphone a son propre jitter buffer par-dessus).
-        let prime = (sample_rate as usize * 2 * 60 / 1000).max(2);
-        let drift_max = (sample_rate as usize * 2 * 200 / 1000).max(prime * 2); // ~200 ms
+        let drift_max = (sample_rate as usize * 2 * 200 / 1000).max(4); // ~200 ms
         Ok((
             Output {
                 stop,
@@ -668,8 +733,6 @@ pub mod cpal_out {
             },
             Reader {
                 cons: Arc::new(Mutex::new(cons)),
-                primed: Arc::new(AtomicBool::new(false)),
-                prime,
                 drift_max,
             },
         ))

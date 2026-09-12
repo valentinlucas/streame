@@ -34,8 +34,12 @@
     <option value="facing:user">Avant</option>
   </select>
 
-  <label for="mic">Source audio</label>
+  <label for="mic">Source audio (micro)</label>
   <select id="mic"><option value="">Micro par défaut</option></select>
+
+  <label for="sink" id="sink-label">Sortie audio (retour du Mac)</label>
+  <select id="sink"><option value="">Sortie par défaut</option></select>
+  <p id="sink-hint" class="hint" hidden>Sur iPhone, la sortie audio suit le réglage système : choisir les AirPods comme micro les fait aussi devenir la sortie. Si le son sort quand même du haut-parleur, changez la sortie dans le Centre de contrôle (icône AirPlay/audio) — le navigateur n'a pas la main dessus.</p>
 
   <label for="quality">Qualité</label>
   <select id="quality">
