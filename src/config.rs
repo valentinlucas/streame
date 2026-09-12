@@ -38,6 +38,10 @@ pub struct ServerConfig {
     pub h264_profile_level_id: String,
     /// Débit Opus vers le téléphone (retour audio), en bit/s.
     pub return_audio_bitrate: i32,
+    /// Image-clé de sécurité demandée périodiquement au téléphone (s). Les images-clés sont
+    /// normalement demandées à la demande (discontinuité détectée, plus d'images) ; ce filet
+    /// lent borne toute corruption non détectée. 0 = désactivé.
+    pub keyframe_interval_s: u32,
 }
 
 impl Default for ServerConfig {
@@ -50,6 +54,7 @@ impl Default for ServerConfig {
             video_codec: "H264".into(),
             h264_profile_level_id: "42e01f".into(),
             return_audio_bitrate: 64000,
+            keyframe_interval_s: 10,
         }
     }
 }
@@ -62,6 +67,10 @@ pub struct VideoConfig {
     pub fps: i32,
     /// Latence interne des mélangeurs (ms). Augmenter si des images sont perdues.
     pub mixer_latency_ms: u64,
+    /// Lip-sync : retard d'affichage de la vidéo du téléphone (ms) pour l'aligner sur son
+    /// audio, dont la lecture est tamponnée (~70 ms + une trame Opus). 0 = affichage au plus
+    /// tôt (le son est alors légèrement en retard sur l'image). Ajuster à l'œil.
+    pub av_offset_ms: u32,
 }
 
 impl Default for VideoConfig {
@@ -71,6 +80,7 @@ impl Default for VideoConfig {
             height: 1080,
             fps: 30,
             mixer_latency_ms: 60,
+            av_offset_ms: 80,
         }
     }
 }
@@ -102,6 +112,10 @@ pub struct MultiviewConfig {
     pub columns: u32,
     /// Écran sur lequel ouvrir la fenêtre multiview (même syntaxe que output.display).
     pub display: String,
+    /// Affiche l'horloge du Mac (UTC, ms) dans le bandeau de statistiques : avec la page
+    /// `/latency` filmée par le téléphone, l'écart entre les deux horloges donne la latence
+    /// verre à verre.
+    pub clock: bool,
 }
 
 impl Default for MultiviewConfig {
@@ -112,6 +126,7 @@ impl Default for MultiviewConfig {
             height: 720,
             columns: 4,
             display: String::new(),
+            clock: false,
         }
     }
 }

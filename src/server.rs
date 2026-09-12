@@ -79,6 +79,11 @@ pub async fn run(state: Shared, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Result<(
         .route("/api/preview/{id}", post(api_preview))
         .route("/api/take", post(api_take))
         .route("/api/audio", get(api_audio))
+        .route(
+            "/latency",
+            get(|| async { Html(include_str!("../web/latency.html")) }),
+        )
+        .route("/api/time", get(api_time))
         .with_state(state);
 
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem)
@@ -338,6 +343,16 @@ async fn api_audio(State(state): State<Shared>) -> Json<serde_json::Value> {
         "input_device": state.cfg.audio.input_device,
         "sample_rate": state.cfg.audio.sample_rate,
     }))
+}
+
+/// Heure du Mac (ms Unix) : la page /latency s'y cale pour afficher la même horloge que le
+/// multiview, ce qui permet de mesurer la latence « verre à verre » en filmant la page.
+async fn api_time() -> Json<serde_json::Value> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Json(serde_json::json!({ "now_ms": ms }))
 }
 
 fn api_result(ok: bool, state: &Shared) -> Response {

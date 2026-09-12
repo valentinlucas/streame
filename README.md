@@ -225,6 +225,27 @@ disponibles dans `GET /api/state`.
   suit la route système : choisir les AirPods comme micro les fait devenir la route ; sinon,
   Centre de contrôle. Le micro peut être changé pendant le direct (`replaceTrack`, sans
   renégociation).
+- **Décodage vidéo explicite** : `appsrc → rtph264depay → h264parse → vtdec → queue →
+  videoconvert → GPU`, un pipeline par piste, câblé avant le démarrage — déterministe et sans
+  la `multiqueue` de decodebin. Le dépayloadeur est en `request-keyframe`/`wait-for-keyframe` :
+  sur une perte non rattrapée par NACK il demande une image-clé (relayée en PLI) et jette les
+  images jusqu'à elle — bref gel plutôt qu'image pixellisée qui se propage.
+- **Images-clés** : rafale au démarrage, puis à la demande (discontinuité, plus d'images) et un
+  filet de sécurité lent (`keyframe_interval_s`, 10 s par défaut, 0 = off). Pas d'image-clé
+  rapprochée : chacune est lourde et fait osciller la qualité.
+- **Lip-sync** : `video.av_offset_ms` (80 ms par défaut) retarde l'affichage de la vidéo pour
+  l'aligner sur l'audio, dont la lecture est tamponnée (~70 ms + une trame). 0 = au plus tôt.
+  L'alignement est « par construction » (budgets de tampon égalisés), pas par RTCP : à régler à
+  l'œil si besoin.
+- **Jitter buffer** : une seule profondeur (`rtc_latency_ms`, 60 ms) pour audio et vidéo —
+  webrtc-rs 0.21 n'en propose pas une par média ; elle doit couvrir l'aller-retour NACK. En
+  pratique la vidéo s'affiche dès la sortie du buffer et l'audio a en plus son propre tampon
+  adaptatif de lecture (compensation de dérive), donc les latences effectives diffèrent déjà.
+- **Mesure de latence verre à verre** : `multiview.clock = true` affiche l'horloge du Mac (UTC,
+  ms) dans le bandeau du multiview ; la page `https://<mac>:8443/latency` affiche la même
+  horloge calée sur le Mac. Filmer cette page avec le téléphone : l'écart entre l'heure dans
+  l'image décodée et celle du bandeau = latence verre à verre. CoreAudio est ouvert avec un
+  tampon de 256 trames (~5 ms) quand la carte l'annonce.
 
 ## Tests
 

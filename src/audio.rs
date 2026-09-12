@@ -345,10 +345,14 @@ pub mod cpal_out {
         meters: Arc<Meters>,
     ) -> Result<(Output, Pusher, Pusher)> {
         let dev = find_device(name)?;
+        let buffer_size = dev
+            .default_output_config()
+            .map(|c| low_latency_buffer(c.buffer_size()))
+            .unwrap_or(cpal::BufferSize::Default);
         let config = cpal::StreamConfig {
             channels: out_channels,
             sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size,
         };
         let n = out_channels as usize;
         let cap = (sample_rate as usize * 2 * 400 / 1000).max(4); // stéréo, ~400 ms
@@ -468,6 +472,21 @@ pub mod cpal_out {
             mk(phone_prod),
             mk(brand_prod),
         ))
+    }
+
+    /// Taille de tampon CoreAudio visée (trames par callback) : 256 @ 48 kHz ≈ 5,3 ms, contre
+    /// 512 (~10,7 ms) par défaut. On ne l'impose que si la carte l'annonce comme supportée.
+    const LOW_LATENCY_FRAMES: u32 = 256;
+
+    fn low_latency_buffer(supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+        match supported {
+            cpal::SupportedBufferSize::Range { min, max }
+                if *min <= LOW_LATENCY_FRAMES && LOW_LATENCY_FRAMES <= *max =>
+            {
+                cpal::BufferSize::Fixed(LOW_LATENCY_FRAMES)
+            }
+            _ => cpal::BufferSize::Default,
+        }
     }
 
     /// Écart maximal du rapport de ré-échantillonnage (±0,5 % : inaudible, et 25× la dérive
@@ -669,10 +688,14 @@ pub mod cpal_out {
         meters: Arc<Meters>,
     ) -> Result<(Output, Reader)> {
         let dev = find_input_device(name)?;
+        let buffer_size = dev
+            .default_input_config()
+            .map(|c| low_latency_buffer(c.buffer_size()))
+            .unwrap_or(cpal::BufferSize::Default);
         let config = cpal::StreamConfig {
             channels: in_channels,
             sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size,
         };
         let in_ch = in_channels as usize;
         let capacity = (sample_rate as usize * 2 * 400 / 1000).max(4); // stéréo, ~400 ms

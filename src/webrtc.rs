@@ -19,6 +19,7 @@ use crate::engine::{frame_appsink, Engine, PhoneStats, RtpStats};
 use anyhow::{Context, Result};
 use gst::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -129,6 +130,10 @@ struct Handler {
     name: String,
     /// Codec vidéo réellement négocié (rempli à l'arrivée de la piste), pour l'affichage /control.
     video_codec: Arc<StdMutex<String>>,
+    /// Retard appliqué à la vidéo pour l'aligner sur l'audio (lip-sync), en ms.
+    av_offset_ms: u32,
+    /// Image-clé de sécurité périodique (s), 0 = désactivée.
+    keyframe_interval_s: u32,
 }
 
 #[async_trait::async_trait]
@@ -188,9 +193,23 @@ impl PeerConnectionEventHandler for Handler {
         }
 
         // Un pipeline dédié par piste (voir PhoneSession::decode_pipelines) : isolation totale,
-        // pas d'interférence entre l'audio et la vidéo au démarrage.
+        // pas d'interférence entre l'audio et la vidéo au démarrage. Les caps RTP complètes
+        // (fmtp : packetization-mode, profile-level-id, sprop…) sont posées dès la création —
+        // sans elles rtph264depay peut mal réassembler les paquets FU-A de l'iPhone.
+        let fmtp = codec
+            .as_ref()
+            .map(|c| c.sdp_fmtp_line.clone())
+            .unwrap_or_default();
+        let keyframe_needed = Arc::new(AtomicBool::new(false));
+        let params = DecodeParams {
+            media,
+            encoding,
+            clock_rate,
+            fmtp: &fmtp,
+            av_offset_ms: self.av_offset_ms,
+        };
         let pipe_name = format!("decode-{}-{media}", self.name.replace(' ', "_"));
-        let appsrc = match build_decode_chain(&pipe_name, &self.engine) {
+        let appsrc = match build_decode_chain(&pipe_name, &params, &self.engine, keyframe_needed.clone()) {
             Ok((pipe, appsrc)) => {
                 self.decode_pipelines.lock().unwrap().push(pipe);
                 appsrc
@@ -203,14 +222,6 @@ impl PeerConnectionEventHandler for Handler {
 
         // Boucle de lecture RTP : les paquets sortent déjà ordonnés/lissés du jitter buffer.
         let media_owned = media.to_string();
-        let encoding_owned = encoding.to_string();
-        // Paramètres fmtp (packetization-mode, profile-level-id, sprop-parameter-sets…) : sans
-        // eux, rtph264depay peut mal réassembler les paquets FU-A de l'iPhone. webrtcbin les
-        // fournissait dans les caps ; on les reconstitue depuis la ligne fmtp négociée.
-        let fmtp_owned = codec
-            .as_ref()
-            .map(|c| c.sdp_fmtp_line.clone())
-            .unwrap_or_default();
         let cancel = self.cancel.clone();
         // Piste conservée pour l'envoi périodique de PLI (vidéo) ; la boucle ci-dessous consomme `track`.
         let pli_track = if media == "video" {
@@ -219,7 +230,6 @@ impl PeerConnectionEventHandler for Handler {
             None
         };
         tokio::spawn(async move {
-            let mut caps_set = false;
             let mut count: u64 = 0u64;
             loop {
                 let evt = tokio::select! {
@@ -232,24 +242,8 @@ impl PeerConnectionEventHandler for Handler {
                 };
                 match evt {
                     TrackRemoteEvent::OnRtpPacket(pkt) => {
-                        if !caps_set {
-                            let mut cb = gst::Caps::builder("application/x-rtp")
-                                .field("media", media_owned.as_str())
-                                .field("encoding-name", encoding_owned.as_str())
-                                .field("clock-rate", clock_rate as i32)
-                                .field("payload", pkt.header.payload_type as i32);
-                            for kv in fmtp_owned.split(';') {
-                                if let Some((k, v)) = kv.split_once('=') {
-                                    let (k, v) = (k.trim(), v.trim());
-                                    if !k.is_empty() && !v.is_empty() {
-                                        cb = cb.field(k, v);
-                                    }
-                                }
-                            }
-                            let caps = cb.build();
-                            appsrc.set_caps(Some(&caps));
-                            caps_set = true;
-                            info!("piste {media_owned} : 1er paquet RTP (pt={}), caps appsrc = {caps}", pkt.header.payload_type);
+                        if count == 0 {
+                            info!("piste {media_owned} : 1er paquet RTP (pt={})", pkt.header.payload_type);
                         }
                         let mut bytes = vec![0u8; pkt.marshal_size()];
                         match pkt.marshal_to(&mut bytes) {
@@ -287,12 +281,20 @@ impl PeerConnectionEventHandler for Handler {
         // Sans cette rafale initiale, si la 1re image-clé arrive avant que decodebin ne soit prêt,
         // rtph264depay attend la suivante et l'image met longtemps (ou ne vient pas) — d'où les
         // démarrages « sans image » qu'on ne récupérait qu'en relançant le stream.
-        // Ensuite, plus de PLI périodique : chaque PLI force une image-clé (grosse, qualité en
-        // dents de scie). Un chien de garde n'en redemande que si les images cessent d'arriver
-        // (perte non rattrapée par NACK, encodeur relancé côté téléphone…).
+        // Demandes d'image-clé (PLI) — trois déclencheurs, à la manière d'un récepteur libwebrtc :
+        //  1. **discontinuité** : le dépayloadeur (request-keyframe) a vu une perte que NACK n'a
+        //     pas rattrapée et a émis un ForceKeyUnit vers l'amont → on relaie en PLI, tout de
+        //     suite ; en attendant il jette les images (wait-for-keyframe) : un bref gel plutôt
+        //     qu'une image pixellisée qui se propage ;
+        //  2. **famine** : plus aucune image décodée (encodeur relancé, flux muet…) ;
+        //  3. **filet de sécurité** périodique et lent (`keyframe_interval_s`, 0 = off) : borne
+        //     toute corruption non détectée, pour un coût négligeable (1 image sur ~300 à 10 s).
+        // Pas de PLI rapproché (toutes les 3 s comme avant) : chaque image-clé est lourde et
+        // fait osciller la qualité.
         if let Some(pli_track) = pli_track {
             let cancel = self.cancel.clone();
             let engine = self.engine.clone();
+            let interval = self.keyframe_interval_s;
             tokio::spawn(async move {
                 let send_pli = |t: Arc<dyn TrackRemote>| async move {
                     let pli = PictureLossIndication {
@@ -301,7 +303,7 @@ impl PeerConnectionEventHandler for Handler {
                     };
                     t.write_rtcp(vec![Box::new(pli)]).await.is_ok()
                 };
-                // Rafale de démarrage.
+                // Rafale de démarrage (le décodeur a besoin d'une image-clé + SPS/PPS).
                 for _ in 0..6 {
                     if !send_pli(pli_track.clone()).await {
                         return;
@@ -311,25 +313,33 @@ impl PeerConnectionEventHandler for Handler {
                         _ = tokio::time::sleep(Duration::from_millis(400)) => {}
                     }
                 }
-                // Chien de garde : image-clé uniquement si le décodeur est à sec depuis > 2 s.
-                let mut starved_since: Option<Instant> = None;
+                let mut last_pli = Instant::now();
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                     }
-                    let flowing = engine.phone_slot().fps.value() > 0.0;
-                    if flowing {
-                        starved_since = None;
-                        continue;
-                    }
-                    let since = *starved_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= Duration::from_secs(2) {
-                        warn!("vidéo : plus d'images décodées depuis 2 s, demande d'image-clé (PLI)");
+                    let now = Instant::now();
+                    let since = now.duration_since(last_pli);
+                    let reason = if keyframe_needed.swap(false, Ordering::Relaxed) && since >= Duration::from_millis(300) {
+                        Some(("discontinuité détectée par le dépayloadeur", true))
+                    } else if engine.phone_slot().fps.value() <= 0.0 && since >= Duration::from_secs(2) {
+                        Some(("plus aucune image décodée", true))
+                    } else if interval > 0 && since >= Duration::from_secs(interval as u64) {
+                        Some(("image-clé de sécurité périodique", false))
+                    } else {
+                        None
+                    };
+                    if let Some((why, loud)) = reason {
+                        if loud {
+                            warn!("vidéo : demande d'image-clé (PLI) — {why}");
+                        } else {
+                            debug!("vidéo : demande d'image-clé (PLI) — {why}");
+                        }
                         if !send_pli(pli_track.clone()).await {
                             return;
                         }
-                        starved_since = Some(Instant::now()); // au plus un PLI toutes les 2 s
+                        last_pli = now;
                     }
                 }
             });
@@ -393,6 +403,8 @@ impl PhoneSession {
             cancel: cancel.clone(),
             name: name.clone(),
             video_codec: video_codec.clone(),
+            av_offset_ms: cfg.video.av_offset_ms,
+            keyframe_interval_s: cfg.server.keyframe_interval_s,
         });
 
         // --- PeerConnection -------------------------------------------------------------------
@@ -676,30 +688,169 @@ fn rtp_media_encoding(kind: RtpCodecKind, mime: &str) -> (&'static str, &'static
     }
 }
 
-/// Construit un **pipeline dédié** pour une piste entrante : `appsrc(application/x-rtp) →
-/// decodebin`. decodebin auto-branche le dépayloadeur + le décodeur (matériel via vtdec) selon
-/// les caps, et `attach_decoded_branch` relie la sortie décodée au moteur (GPU pour la vidéo,
-/// cpal pour l'audio). Le pipeline est démarré et surveillé ici ; les caps de l'appsrc sont
-/// posées au 1er paquet dans la boucle de lecture. Renvoie le pipeline (à conserver et arrêter)
-/// et l'appsrc où pousser le RTP.
-fn build_decode_chain(name: &str, engine: &Arc<Engine>) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+/// Paramètres d'une piste entrante pour construire sa chaîne de décodage.
+struct DecodeParams<'a> {
+    media: &'a str,
+    encoding: &'a str,
+    clock_rate: u32,
+    /// Ligne fmtp négociée (`packetization-mode=1;profile-level-id=…`), reportée dans les caps.
+    fmtp: &'a str,
+    /// Retard d'affichage de la vidéo pour l'aligner sur l'audio (0 = au plus tôt).
+    av_offset_ms: u32,
+}
+
+/// Renvoie le premier élément GStreamer disponible parmi des candidats (décodeur matériel
+/// d'abord, logiciel en repli).
+fn make_first(names: &[&str]) -> Result<gst::Element> {
+    for n in names {
+        if let Ok(e) = gst::ElementFactory::make(n).build() {
+            return Ok(e);
+        }
+    }
+    Err(anyhow::anyhow!("aucun élément GStreamer disponible parmi {names:?}"))
+}
+
+/// Dépayloadeur RTP configuré pour la résilience : sur une discontinuité (perte non rattrapée
+/// par NACK) il émet un ForceKeyUnit vers l'amont — relayé en PLI par la boucle de la piste —
+/// et jette les images jusqu'à la prochaine image-clé (bref gel plutôt qu'image corrompue).
+/// Propriétés disponibles à partir de GStreamer 1.20 ; ignorées sinon.
+fn make_depay(name: &str) -> Result<gst::Element> {
+    let el = gst::ElementFactory::make(name).build()?;
+    for prop in ["request-keyframe", "wait-for-keyframe"] {
+        if el.has_property(prop) {
+            el.set_property(prop, true);
+        }
+    }
+    Ok(el)
+}
+
+/// Construit un **pipeline dédié** pour une piste entrante et le démarre.
+///
+/// Vidéo : chaîne **explicite** `appsrc(x-rtp) → dépay → parseur → décodeur (VideoToolbox) →
+/// queue → videoconvert → GPU`, câblée en entier avant le passage en PLAYING — déterministe,
+/// sans l'autoplug ni la `multiqueue` de decodebin (quelques dizaines de ms de moins). Les caps
+/// RTP complètes sont posées dès la création. Si `av_offset_ms` > 0, le sink est synchronisé
+/// sur l'horloge avec cette latence : chaque image est affichée `av_offset_ms` après son
+/// arrivée, ce qui l'aligne sur le son (dont la lecture est tamponnée d'autant).
+/// Codec non prévu : repli sur decodebin (autoplug).
+fn build_decode_chain(
+    name: &str,
+    p: &DecodeParams<'_>,
+    engine: &Arc<Engine>,
+    keyframe_needed: Arc<AtomicBool>,
+) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
     let pipe = gst::Pipeline::with_name(name);
+
+    let mut cb = gst::Caps::builder("application/x-rtp")
+        .field("media", p.media)
+        .field("encoding-name", p.encoding)
+        .field("clock-rate", p.clock_rate as i32);
+    for kv in p.fmtp.split(';') {
+        if let Some((k, v)) = kv.split_once('=') {
+            let (k, v) = (k.trim(), v.trim());
+            if !k.is_empty() && !v.is_empty() {
+                cb = cb.field(k, v);
+            }
+        }
+    }
+    let caps = cb.build();
+    let is_video = p.media == "video";
+    let offset_ns = if is_video {
+        p.av_offset_ms as i64 * 1_000_000
+    } else {
+        0
+    };
     let appsrc = gst_app::AppSrc::builder()
+        .caps(&caps)
         .is_live(true)
         .format(gst::Format::Time)
         .do_timestamp(true)
+        .min_latency(offset_ns)
+        .max_latency(offset_ns)
         .build();
     let src: gst::Element = appsrc.clone().upcast();
-    let decode = gst::ElementFactory::make("decodebin").build()?;
-    pipe.add_many([&src, &decode])?;
-    src.link(&decode)?;
-    let engine2 = engine.clone();
-    let pipe2 = pipe.clone();
-    decode.connect_pad_added(move |_, dpad| {
-        if let Err(e) = attach_decoded_branch(&pipe2, dpad, &engine2) {
-            error!("branche de décodage : {e:#}");
+
+    // Relais des demandes d'image-clé du dépayloadeur (événement amont ForceKeyUnit).
+    if let Some(pad) = src.static_pad("src") {
+        let flag = keyframe_needed;
+        pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(ev)) = &info.data {
+                if gst_video::UpstreamForceKeyUnitEvent::parse(ev).is_ok() {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    let mut chain: Vec<gst::Element> = vec![src.clone()];
+    let explicit = match (is_video, p.encoding) {
+        (true, "H264") => {
+            chain.push(make_depay("rtph264depay")?);
+            chain.push(gst::ElementFactory::make("h264parse").build()?);
+            chain.push(make_first(&["vtdec_hw", "vtdec", "avdec_h264"])?);
+            true
         }
-    });
+        (true, "H265") => {
+            chain.push(make_depay("rtph265depay")?);
+            chain.push(gst::ElementFactory::make("h265parse").build()?);
+            chain.push(make_first(&["vtdec_hw", "vtdec", "avdec_h265"])?);
+            true
+        }
+        (true, "VP8") => {
+            chain.push(make_depay("rtpvp8depay")?);
+            chain.push(make_first(&["vp8dec", "avdec_vp8"])?);
+            true
+        }
+        (true, "VP9") => {
+            chain.push(make_depay("rtpvp9depay")?);
+            chain.push(make_first(&["vp9dec", "vtdec_hw", "vtdec", "avdec_vp9"])?);
+            true
+        }
+        _ => false,
+    };
+
+    if !explicit {
+        // Repli générique (audio hors macOS, codec inconnu) : decodebin auto-branche.
+        let decode = gst::ElementFactory::make("decodebin").build()?;
+        pipe.add_many([&src, &decode])?;
+        src.link(&decode)?;
+        let engine2 = engine.clone();
+        let pipe2 = pipe.clone();
+        decode.connect_pad_added(move |_, dpad| {
+            if let Err(e) = attach_decoded_branch(&pipe2, dpad, &engine2) {
+                error!("branche de décodage : {e:#}");
+            }
+        });
+    } else {
+        // Découple le décodeur de l'attente de synchronisation du sink ; jette les images en
+        // retard plutôt que d'accumuler.
+        let q = gst::ElementFactory::make("queue")
+            .property("max-size-buffers", 3u32)
+            .property("max-size-time", 0u64)
+            .property("max-size-bytes", 0u32)
+            .property_from_str("leaky", "downstream")
+            .build()?;
+        chain.push(q);
+        chain.push(gst::ElementFactory::make("videoconvert").build()?);
+        chain.push(
+            gst::ElementFactory::make("capsfilter")
+                .property("caps", crate::engine::gpu_caps())
+                .build()?,
+        );
+        chain.push(frame_appsink(engine.phone_slot().clone(), offset_ns > 0).upcast());
+        let refs: Vec<&gst::Element> = chain.iter().collect();
+        pipe.add_many(&refs)?;
+        gst::Element::link_many(&refs)?;
+        info!(
+            "chaîne vidéo {} câblée ({} éléments, décodeur {}, retard A/V {} ms)",
+            p.encoding,
+            chain.len(),
+            chain[3].factory().map(|f| f.name().to_string()).unwrap_or_default(),
+            p.av_offset_ms
+        );
+    }
+
     spawn_bus_watch(&pipe, name.to_string());
     pipe.set_state(gst::State::Playing)
         .with_context(|| format!("démarrage du pipeline de décodage « {name} »"))?;

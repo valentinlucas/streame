@@ -229,6 +229,17 @@ impl App {
             self.stats_text = parts.join(" · ");
             self.stats_at = Instant::now();
         }
+        // Horloge (UTC, ms) pour la mesure de latence verre à verre avec la page /latency.
+        let overlay = if self.engine.config().multiview.clock {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let (s, m) = (ms / 1000 % 86400, ms % 1000);
+            format!("{} · {:02}:{:02}:{:02}.{:03} UTC", self.stats_text, s / 3600, s / 60 % 60, s % 60, m)
+        } else {
+            self.stats_text.clone()
+        };
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -236,7 +247,7 @@ impl App {
         let res = match ws.target {
             Target::Program => renderer.render_program(&ws.surface, &self.engine),
             Target::Multiview => renderer
-                .render_multiview(&ws.surface, &self.engine, &self.stats_text)
+                .render_multiview(&ws.surface, &self.engine, &overlay)
                 .map(|_| true),
         };
         match res {

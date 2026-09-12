@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streame — mesure de latence</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font-family: -apple-system, system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4vh; }
+  #clock { font: 700 16vw/1 ui-monospace, Menlo, monospace; letter-spacing: .04em; font-variant-numeric: tabular-nums; }
+  #bar { width: 80vw; height: 6vh; background: #222; border-radius: 1vh; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #fff; }
+  p { color: #999; font-size: .95rem; max-width: 60ch; text-align: center; margin: 0 16px; line-height: 1.45; }
+  #off { color: #6c6; font-size: .85rem; }
+</style>
+</head>
+<body>
+<div id="clock">--:--:--.---</div>
+<div id="bar"><i id="fill"></i></div>
+<p>Horloge <b>du Mac</b> (UTC, calée via <code>/api/time</code>). Filmez cet écran avec le téléphone et activez
+<code>clock = true</code> dans <code>[multiview]</code> : l'écart entre l'heure affichée dans l'image décodée et celle du
+multiview est la latence verre à verre.</p>
+<p id="off">synchronisation…</p>
+<script>
+  // Décalage horloge locale → horloge du Mac : plusieurs allers-retours, on garde le plus court
+  // (RTT minimal = estimation la plus juste), correction par RTT/2.
+  let offset = 0;
+  async function sync() {
+    let best = null;
+    for (let i = 0; i < 6; i++) {
+      const t0 = Date.now();
+      const r = await fetch('/api/time', { cache: 'no-store' }).then((x) => x.json());
+      const t1 = Date.now();
+      const rtt = t1 - t0;
+      const est = r.now_ms + rtt / 2 - t1;
+      if (best === null || rtt < best.rtt) best = { rtt, est };
+    }
+    offset = best.est;
+    document.getElementById('off').textContent = `calée sur le Mac · RTT ${best.rtt} ms · décalage ${Math.round(offset)} ms`;
+  }
+  function tick() {
+    const t = Date.now() + offset;
+    const d = new Date(t);
+    const pad = (n, w) => String(n).padStart(w, '0');
+    document.getElementById('clock').textContent =
+      `${pad(d.getUTCHours(), 2)}:${pad(d.getUTCMinutes(), 2)}:${pad(d.getUTCSeconds(), 2)}.${pad(d.getUTCMilliseconds(), 3)}`;
+    // Barre qui balaye en 1 s : lisible sur une photo même si les chiffres sont flous.
+    document.getElementById('fill').style.width = ((t % 1000) / 10) + '%';
+    requestAnimationFrame(tick);
+  }
+  sync().then(() => setInterval(sync, 30000));
+  tick();
+</script>
+</body>
+</html>

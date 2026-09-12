@@ -8,12 +8,14 @@ rtc_latency_ms = 60
 video_codec = "H264"
 h264_profile_level_id = "42e01f"
 return_audio_bitrate = 64000
+keyframe_interval_s = 10
 
 [video]
 width = 1920
 height = 1080
 fps = 30
 mixer_latency_ms = 60
+av_offset_ms = 80
 
 [output]
 display = "HDMI"
@@ -25,6 +27,7 @@ width = 1280
 height = 720
 columns = 4
 display = ""
+clock = false
 
 [audio]
 enabled = true
