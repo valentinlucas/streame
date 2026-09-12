@@ -300,9 +300,13 @@ impl PhoneSession {
         );
 
         let mut ice_servers = vec![];
-        if !cfg.server.stun_server.trim().is_empty() {
+        let stun = cfg.server.stun_server.trim();
+        if !stun.is_empty() {
+            // webrtc-rs attend la forme RFC 7064 « stun:hôte:port » (sans « // »), alors que la
+            // config utilise l'ancienne forme « stun://… » de webrtcbin : on normalise.
+            let url = stun.replacen("://", ":", 1);
             ice_servers.push(RTCIceServer {
-                urls: vec![cfg.server.stun_server.trim().to_string()],
+                urls: vec![url],
                 ..Default::default()
             });
         }
