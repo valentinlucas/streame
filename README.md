@@ -9,7 +9,7 @@ téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôl
  Téléphone (Safari/Chrome)                     Mac (streame)
  ┌───────────────────────┐   HTTPS + WS      ┌──────────────────────────────────────────────┐
  │ page web /            │◄──────────────────│ serveur axum : page, signaling, /control, API │
- │ caméra + micro        │ ── WebRTC vidéo ─►│ webrtcbin ─► vtdec (NV12) ─► texture GPU       │
+ │ caméra + micro        │ ── WebRTC vidéo ─►│ webrtc-rs ─► vtdec (NV12) ─► texture GPU        │
  │ retour audio ◄────────│ ◄─ WebRTC audio ─ │                       ▼                       │
  └───────────────────────┘                   │  scènes (wgpu/Metal) ─► programme ─► HDMI      │
                                              │        └─► multiview (fenêtre cliquable)        │
@@ -59,7 +59,7 @@ téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôl
 # 1. Outils
 xcode-select --install
 curl https://sh.rustup.rs -sSf | sh          # Rust
-brew install gstreamer libnice-gstreamer pkg-config   # GStreamer (formule unifiée) + plugin ICE pour WebRTC
+brew install gstreamer pkg-config   # GStreamer (formule unifiée) pour le décodage/encodage
 
 # 2. Compilation
 export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$PKG_CONFIG_PATH"
@@ -70,8 +70,9 @@ cargo build --release
 ./target/release/streame devices             # liste cartes son (nom, canaux) et écrans
 ```
 
-> Homebrew livre le plugin `nice` (ICE, indispensable à `webrtcbin`) dans la formule séparée
-> `libnice-gstreamer` ; sans elle, `streame check` signale `nicesrc` manquant. Les avertissements
+> Le transport WebRTC (ICE/DTLS/SRTP) est assuré par **webrtc-rs** (crate `webrtc` + cœur
+> sans-I/O `rtc`), plus par GStreamer : `libnice-gstreamer`/`webrtcbin` ne sont donc plus
+> nécessaires. GStreamer ne sert qu'au décodage matériel et aux codecs. Les avertissements
 > `GLib-GIRepository` du scanner de plugins au premier lancement viennent du plugin Python de
 > GStreamer et sont sans conséquence. Les binaires GStreamer officiels (gstreamer.freedesktop.org,
 > paquet « development ») fonctionnent aussi.
@@ -172,7 +173,7 @@ Les fichiers vidéo avec couche alpha (ProRes 4444, WebM VP9 alpha…) sont comp
 | `src/engine.rs` | État de la régie (scènes, programme, preview, transitions), chargement des calques (PNG, texte, fichiers vidéo via `uridecodebin` → `appsink` en boucle), routage audio (`audioconvert mix-matrix`). |
 | `src/render.rs` | Rendu wgpu : chaque scène dans une texture hors écran, fondu programme, tuiles/cadres/libellés du multiview, conversion NV12 → RGB dans le shader. |
 | `src/frame.rs` | Emplacements d'images partagés entre GStreamer et le rendu (dernière image + compteur i/s). |
-| `src/webrtc.rs` | Une session `webrtcbin` par téléphone (le Mac fait l'offre) ; vidéo décodée vers le GPU via `appsink`, audio vers `interaudiosink` ; retour audio encodé en Opus. |
+| `src/webrtc.rs` | Une session **webrtc-rs** par téléphone (le Mac fait l'offre) : ICE/DTLS/SRTP/RTP, jitter buffer et TWCC/NACK gérés en Rust. Les paquets RTP entrants sont poussés dans un `appsrc` → `decodebin` (vtdec vers le GPU, opusdec vers cpal) ; le retour audio est encodé en Opus (`opusenc`) et écrit sur une piste locale. |
 | `src/server.rs` | Serveur HTTPS axum : page téléphone, WebSocket de signaling, page/WebSocket de contrôle, API REST (avec statistiques). |
 | `src/ui.rs` | Fenêtres winit : programme (plein écran sur l'écran choisi) et multiview (clics, clavier), rendu cadencé sur la fréquence de l'écran. |
 | `src/streamdeck.rs` | Thread Stream Deck (hidapi) : rendu des touches, actions, reconnexion. |
@@ -203,10 +204,13 @@ disponibles dans `GET /api/state`.
   fait le mixage et l'E/S.
 - Le retour audio vers le téléphone est stéréo 48 kHz Opus ; l'annulation d'écho est faite côté téléphone.
 - Sur Chrome/Android, forcer `video_codec = "VP8"` si le H264 matériel n'est pas disponible.
-- La négociation active l'extension d'en-tête RTP *transport-wide-cc* : sans elle, l'estimation
-  de bande passante du téléphone reste bloquée au débit plancher (~300 kb/s) et l'image est très
-  dégradée malgré un réseau rapide. Le débit maximal est fixé côté téléphone (`web/app.js`) selon
-  la résolution (8 Mb/s en 1080p).
+- **Transport WebRTC via webrtc-rs** (v0.21) : `register_default_interceptors` active NACK, les
+  rapports RTCP et le *transport-wide-cc* (TWCC) — l'extension d'en-tête RTP est déclarée
+  automatiquement. Sans TWCC, l'estimation de bande passante du téléphone reste bloquée au débit
+  plancher (~300 kb/s) et l'image est très dégradée malgré un réseau rapide. Le jitter buffer
+  adaptatif de webrtc-rs lisse le flux entrant (profondeur = `rtc_latency_ms`) avant le décodage.
+  Le débit maximal est fixé côté téléphone (`web/app.js`) selon la résolution (8 Mb/s en 1080p).
+  Le mode mDNS *QueryOnly* résout les candidats `.local` d'iOS/Safari pour l'ICE sur le LAN.
 
 ## Tests
 

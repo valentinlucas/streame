@@ -1450,7 +1450,11 @@ impl Engine {
 
 /// Vérifie la présence des éléments GStreamer nécessaires.
 pub fn check_elements() -> Vec<&'static str> {
+    // Le transport WebRTC (ICE/DTLS/SRTP) est assuré par webrtc-rs, pas GStreamer : plus besoin
+    // de webrtcbin, nicesrc, dtlssrtpdec, srtpdec ni rtpopuspay. GStreamer ne fait que
+    // dépayloader/décoder les flux entrants (via decodebin) et coder l'Opus de retour.
     const REQUIRED: &[&str] = &[
+        "appsrc",
         "videoconvert",
         "capsfilter",
         "queue",
@@ -1463,14 +1467,10 @@ pub fn check_elements() -> Vec<&'static str> {
         "uridecodebin",
         "audioconvert",
         "audioresample",
-        "webrtcbin",
         "opusenc",
         "opusdec",
-        "rtpopuspay",
         "rtpopusdepay",
-        "nicesrc",
-        "dtlssrtpdec",
-        "srtpdec",
+        "rtph264depay",
         "appsink",
     ];
     REQUIRED
