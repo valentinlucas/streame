@@ -53,6 +53,10 @@ use webrtc::peer_connection::{
 };
 use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::{default_runtime, Runtime};
+#[cfg(target_os = "macos")]
+use rtc::media::io::sample_builder::SampleBuilder;
+#[cfg(target_os = "macos")]
+use rtc::rtp::codec::h264::H264Packet;
 
 /// Messages téléphone → serveur.
 #[derive(Debug, Clone, Deserialize)]
@@ -242,6 +246,29 @@ impl PeerConnectionEventHandler for Handler {
             .map(|c| c.sdp_fmtp_line.clone())
             .unwrap_or_default();
         let keyframe_needed = Arc::new(AtomicBool::new(false));
+        // Piste conservée pour les demandes d'image-clé (vidéo) ; les boucles ci-dessous
+        // consomment `track`.
+        let pli_track = if media == "video" {
+            Some(track.clone())
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let native_h264 = media == "video" && encoding == "H264";
+        #[cfg(not(target_os = "macos"))]
+        let native_h264 = false;
+        if native_h264 {
+            // Chaîne native zéro-copie : dépaquetisation en Rust → VideoToolbox → IOSurface → GPU.
+            #[cfg(target_os = "macos")]
+            spawn_native_h264(
+                track,
+                self.engine.clone(),
+                self.cancel.clone(),
+                keyframe_needed.clone(),
+                self.av_offset_ms,
+                clock_rate,
+            );
+        } else {
         let params = DecodeParams {
             media,
             encoding,
@@ -264,12 +291,6 @@ impl PeerConnectionEventHandler for Handler {
         // Boucle de lecture RTP : les paquets sortent déjà ordonnés/lissés du jitter buffer.
         let media_owned = media.to_string();
         let cancel = self.cancel.clone();
-        // Piste conservée pour l'envoi périodique de PLI (vidéo) ; la boucle ci-dessous consomme `track`.
-        let pli_track = if media == "video" {
-            Some(track.clone())
-        } else {
-            None
-        };
         tokio::spawn(async move {
             let mut count: u64 = 0u64;
             loop {
@@ -316,6 +337,7 @@ impl PeerConnectionEventHandler for Handler {
             }
             let _ = appsrc.end_of_stream();
         });
+        }
 
         // Vidéo : demander une image-clé. On envoie un PLI tout de suite (le décodeur a besoin
         // d'une image-clé + SPS/PPS pour démarrer), puis une petite rafale, puis un rythme lent.
@@ -1323,6 +1345,96 @@ fn spawn_opus_return(
                 }
                 Ok(_) => {}
                 Err(e) => warn!("encodage Opus retour : {e}"),
+            }
+        }
+    });
+}
+
+/// macOS : vidéo H264 du téléphone en natif, sans GStreamer. Les paquets RTP (déjà ordonnés par
+/// le jitter buffer) sont réassemblés en unités d'accès par le `SampleBuilder` de webrtc-rs,
+/// décodés en matériel par VideoToolbox (`vt.rs`) et livrés au rendu en IOSurface (zéro copie).
+/// Une tâche de présentation applique le retard de lip-sync (`av_offset_ms`).
+#[cfg(target_os = "macos")]
+fn spawn_native_h264(
+    track: Arc<dyn TrackRemote>,
+    engine: Arc<Engine>,
+    cancel: CancellationToken,
+    keyframe_needed: Arc<AtomicBool>,
+    av_offset_ms: u32,
+    clock_rate: u32,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::vt::Decoded>();
+    {
+        let engine = engine.clone();
+        let cancel = cancel.clone();
+        let offset = Duration::from_millis(av_offset_ms as u64);
+        tokio::spawn(async move {
+            loop {
+                let item = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    r = rx.recv() => r,
+                };
+                let Some((arrived, frame)) = item else { break };
+                if !offset.is_zero() {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(arrived + offset)).await;
+                }
+                engine.phone_slot().push_surface(frame);
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let mut decoder = crate::vt::H264Decoder::new(tx);
+        let mut builder = SampleBuilder::new(64, H264Packet::default(), clock_rate.max(1))
+            .with_max_time_delay(Duration::from_millis(200));
+        let mut packets: u64 = 0;
+        let mut started = false;
+        loop {
+            let evt = tokio::select! {
+                _ = cancel.cancelled() => break,
+                evt = track.poll() => evt,
+            };
+            let Some(evt) = evt else {
+                info!("piste video : flux terminé (poll → None)");
+                break;
+            };
+            match evt {
+                TrackRemoteEvent::OnRtpPacket(pkt) => {
+                    packets += 1;
+                    if packets == 1 {
+                        info!(
+                            "piste video : 1er paquet RTP (pt={}), décodage VideoToolbox natif",
+                            pkt.header.payload_type
+                        );
+                    }
+                    let now = Instant::now();
+                    builder.push(now, pkt);
+                    while let Some(sample) = builder.pop(now) {
+                        if sample.prev_dropped_packets > 0 {
+                            decoder.mark_loss();
+                            keyframe_needed.store(true, Ordering::Relaxed);
+                        }
+                        match decoder.decode(&sample.data, sample.packet_timestamp) {
+                            crate::vt::Outcome::Ok => {
+                                if !started {
+                                    started = true;
+                                    info!("vidéo : décodage VideoToolbox (matériel, IOSurface) démarré");
+                                }
+                            }
+                            crate::vt::Outcome::NeedKeyframe => {
+                                keyframe_needed.store(true, Ordering::Relaxed);
+                            }
+                            crate::vt::Outcome::Error(e) => {
+                                warn!("VideoToolbox : {e}");
+                                keyframe_needed.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    if packets % 250 == 0 {
+                        debug!("piste video : {packets} paquets RTP, {} images soumises", decoder.frames_submitted());
+                    }
+                }
+                TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => break,
+                _ => {}
             }
         }
     });

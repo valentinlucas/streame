@@ -16,6 +16,7 @@ mod streamdeck;
 mod text;
 mod tls;
 mod ui;
+mod vt;
 mod webrtc;
 
 use anyhow::{Context, Result};

@@ -5,7 +5,13 @@
 
 use crate::config::Geometry;
 use crate::engine::{Engine, LayerKind, RenderState, NO_PHONE_TEXT};
-use crate::frame::{with_planes, FrameSlot, PixelFormat};
+use crate::frame::{with_planes, Frame, FrameSlot, PixelFormat, SurfaceFrame};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage,
+};
 use crate::layout::{self, Rect};
 use crate::text;
 use anyhow::{anyhow, Context, Result};
@@ -105,6 +111,9 @@ struct GpuTex {
     bind_group: wgpu::BindGroup,
     /// Séquence de la dernière image envoyée (sources vidéo).
     seq: u64,
+    /// IOSurface enveloppée (textures importées sans copie) : évite de ré-importer tant que le
+    /// décodeur resservit le même tampon de son pool.
+    surface_id: Option<u32>,
 }
 
 /// Une commande de dessin : rectangle en pixels de la cible, texture ou couleur.
@@ -160,6 +169,8 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     dummy: GpuTex,
     textures: HashMap<u64, GpuTex>,
+    /// MTLDevice sous-jacent de wgpu (pour importer des IOSurface), résolu à la demande.
+    raw_device: std::cell::OnceCell<Option<Retained<ProtocolObject<dyn MTLDevice>>>>,
     labels: HashMap<String, u64>,
     dyn_labels: HashMap<String, (String, u64)>,
     next_label: u64,
@@ -299,6 +310,7 @@ impl Renderer {
             sampler,
             dummy,
             textures: HashMap::new(),
+            raw_device: std::cell::OnceCell::new(),
             labels: HashMap::new(),
             dyn_labels: HashMap::new(),
             next_label: 1,
@@ -458,6 +470,24 @@ impl Renderer {
                 None,
             )
         };
+        Self::wrap_tex(device, layout, uniforms, sampler, width, height, kind, tex0, tex1, None)
+    }
+
+    /// Enveloppe des textures déjà créées (allouées par wgpu ou importées d'une IOSurface) dans
+    /// un `GpuTex` prêt à dessiner (vues + bind group).
+    #[allow(clippy::too_many_arguments)]
+    fn wrap_tex(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        uniforms: &wgpu::Buffer,
+        sampler: &wgpu::Sampler,
+        width: u32,
+        height: u32,
+        kind: u32,
+        tex0: wgpu::Texture,
+        tex1: Option<wgpu::Texture>,
+        surface_id: Option<u32>,
+    ) -> GpuTex {
         let view0 = tex0.create_view(&Default::default());
         let view1 = tex1.as_ref().map(|t| t.create_view(&Default::default()));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -495,7 +525,103 @@ impl Renderer {
             view0,
             bind_group,
             seq: 0,
+            surface_id,
         }
+    }
+
+    fn raw_device(&self) -> Option<&Retained<ProtocolObject<dyn MTLDevice>>> {
+        self.raw_device
+            .get_or_init(|| {
+                let dev = unsafe { self.device.as_hal::<wgpu::hal::api::Metal>() };
+                dev.map(|d| d.raw_device().clone())
+            })
+            .as_ref()
+    }
+
+    /// Importe une image IOSurface comme texture(s) Metal **sans copie** : l'IOSurface écrite par
+    /// VideoToolbox/AVFoundation devient directement la texture lue par le shader. Le
+    /// `CVPixelBuffer` reste retenu tant que wgpu détient la texture (`drop_callback`), sinon le
+    /// décodeur recyclerait le tampon sous les pieds du GPU. Si l'emplacement enveloppe déjà
+    /// cette IOSurface (petit pool de tampons côté décodeur), rien à refaire.
+    fn import_surface(&mut self, key: u64, sf: &Arc<SurfaceFrame>) -> bool {
+        if self.textures.get(&key).and_then(|t| t.surface_id) == Some(sf.surface_id) {
+            return true;
+        }
+        let Some(raw_dev) = self.raw_device().cloned() else {
+            return false;
+        };
+        let make = |fmt_mtl: MTLPixelFormat,
+                    fmt_wgpu: wgpu::TextureFormat,
+                    w: u32,
+                    h: u32,
+                    plane: usize,
+                    label: &'static str|
+         -> Option<wgpu::Texture> {
+            let desc = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    fmt_mtl, w as usize, h as usize, false,
+                )
+            };
+            desc.setUsage(MTLTextureUsage::ShaderRead);
+            desc.setStorageMode(MTLStorageMode::Shared);
+            let raw = raw_dev.newTextureWithDescriptor_iosurface_plane(&desc, &sf.surface, plane)?;
+            let keep = sf.clone();
+            let hal = unsafe {
+                wgpu::hal::metal::Device::texture_from_raw(
+                    raw,
+                    fmt_wgpu,
+                    MTLTextureType::Type2D,
+                    1,
+                    1,
+                    wgpu::hal::CopyExtent { width: w, height: h, depth: 1 },
+                    Some(Box::new(move || drop(keep))),
+                )
+            };
+            Some(unsafe {
+                self.device.create_texture_from_hal::<wgpu::hal::api::Metal>(
+                    hal,
+                    &wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: fmt_wgpu,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::TextureUses::RESOURCE,
+                )
+            })
+        };
+        // BGRA : le format de texture Metal fait la permutation, le shader reçoit du RGBA.
+        let (tex0, tex1, kind) = match sf.format {
+            PixelFormat::Nv12 => (
+                make(MTLPixelFormat::R8Unorm, wgpu::TextureFormat::R8Unorm, sf.width, sf.height, 0, "iosurface-y"),
+                make(MTLPixelFormat::RG8Unorm, wgpu::TextureFormat::Rg8Unorm, sf.width.div_ceil(2), sf.height.div_ceil(2), 1, "iosurface-uv"),
+                KIND_NV12,
+            ),
+            PixelFormat::Bgra => (
+                make(MTLPixelFormat::BGRA8Unorm, wgpu::TextureFormat::Bgra8Unorm, sf.width, sf.height, 0, "iosurface-bgra"),
+                None,
+                KIND_RGBA,
+            ),
+            PixelFormat::Rgba => (
+                make(MTLPixelFormat::RGBA8Unorm, wgpu::TextureFormat::Rgba8Unorm, sf.width, sf.height, 0, "iosurface-rgba"),
+                None,
+                KIND_RGBA,
+            ),
+        };
+        let Some(tex0) = tex0 else { return false };
+        if kind == KIND_NV12 && tex1.is_none() {
+            return false;
+        }
+        let gt = Self::wrap_tex(
+            &self.device, &self.layout, &self.uniforms, &self.sampler,
+            sf.width, sf.height, kind, tex0, tex1, Some(sf.surface_id),
+        );
+        self.textures.insert(key, gt);
+        true
     }
 
     fn ensure_tex(&mut self, key: u64, width: u32, height: u32, kind: u32, render_target: bool) {
@@ -553,7 +679,7 @@ impl Renderer {
     /// Envoie la dernière image d'une source vidéo si elle a changé. Retourne la clé si une image existe.
     fn upload_slot(&mut self, slot: &FrameSlot) -> Option<u64> {
         let key = KEY_SLOT | slot.id();
-        let (seq, sample) = slot.latest()?;
+        let (seq, frame) = slot.latest()?;
         if self
             .textures
             .get(&key)
@@ -562,6 +688,18 @@ impl Renderer {
         {
             return Some(key);
         }
+        let sample = match &frame {
+            Frame::Surface(sf) => {
+                if !self.import_surface(key, sf) {
+                    return None;
+                }
+                if let Some(t) = self.textures.get_mut(&key) {
+                    t.seq = seq;
+                }
+                return Some(key);
+            }
+            Frame::Gst(sample) => sample.clone(),
+        };
         let uploaded = with_planes(&sample, |p| {
             let kind = match p.format {
                 PixelFormat::Rgba => KIND_RGBA,
