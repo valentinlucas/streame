@@ -32,7 +32,7 @@ pub fn monitor_name(m: &MonitorHandle) -> String {
             // SAFETY : winit renvoie un pointeur NSScreen valide tant que le MonitorHandle vit.
             let screen: &objc2_app_kit::NSScreen =
                 unsafe { &*(ptr as *const objc2_app_kit::NSScreen) };
-            let name = unsafe { screen.localizedName() }.to_string();
+            let name = screen.localizedName().to_string();
             if !name.is_empty() {
                 return name;
             }

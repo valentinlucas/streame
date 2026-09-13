@@ -1,193 +1,162 @@
-//! Périphériques audio (Behringer Wing ou autre carte multicanal) et matrices de routage.
+//! Audio : périphériques CoreAudio (Behringer Wing ou autre carte multicanal), bus d'habillage
+//! et flux temps réel cpal (mixage, routage, VU-mètres dans les callbacks de la carte).
 
-use anyhow::{anyhow, Result};
-use gst::prelude::*;
-use tracing::{info, warn};
+use cpal::traits::{DeviceTrait, HostTrait};
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::HeapRb;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct AudioDevice {
     pub name: String,
+    /// « Audio/Sink » (sortie) ou « Audio/Source » (entrée).
     pub class: String,
     pub max_channels: Option<i32>,
-    pub device: gst::Device,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Sink,
-    Source,
-}
-
-impl Direction {
-    fn class(self) -> &'static str {
-        match self {
-            Direction::Sink => "Audio/Sink",
-            Direction::Source => "Audio/Source",
-        }
-    }
-}
-
-/// Liste les périphériques audio connus de GStreamer.
+/// Liste les périphériques audio CoreAudio (un même appareil apparaît en sortie et en entrée).
 pub fn list_devices() -> Vec<AudioDevice> {
-    let monitor = gst::DeviceMonitor::new();
-    monitor.add_filter(Some("Audio/Sink"), None);
-    monitor.add_filter(Some("Audio/Source"), None);
-    if let Err(e) = monitor.start() {
-        warn!("impossible de démarrer l'énumération audio : {e}");
-        return Vec::new();
-    }
-    let devices = monitor
-        .devices()
-        .iter()
-        .map(|d| AudioDevice {
-            name: d.display_name().to_string(),
-            class: d.device_class().to_string(),
-            max_channels: d.caps().and_then(|c| max_channels_from_caps(&c)),
-            device: d.clone(),
-        })
-        .collect();
-    monitor.stop();
-    devices
-}
-
-fn max_channels_from_caps(caps: &gst::Caps) -> Option<i32> {
-    let mut max = None;
-    for s in caps.iter() {
-        let v = if let Ok(n) = s.get::<i32>("channels") {
-            Some(n)
-        } else if let Ok(r) = s.get::<gst::IntRange<i32>>("channels") {
-            Some(r.max())
-        } else {
-            None
-        };
-        if let Some(n) = v {
-            max = Some(max.map_or(n, |m: i32| m.max(n)));
-        }
-    }
-    max
-}
-
-pub fn find_device(devices: &[AudioDevice], dir: Direction, pattern: &str) -> Option<AudioDevice> {
-    let p = pattern.to_lowercase();
-    devices
-        .iter()
-        .find(|d| d.class.contains(dir.class()) && d.name.to_lowercase().contains(&p))
-        .cloned()
-}
-
-/// Crée l'élément sink/source correspondant à la sélection ("default", "none", ou un nom).
-/// Retourne l'élément et le nombre de canaux (0 si inconnu).
-pub fn make_device_element(
-    selection: &str,
-    dir: Direction,
-    configured_channels: i32,
-) -> Result<Option<(gst::Element, i32)>> {
-    let sel = selection.trim();
-    if sel.eq_ignore_ascii_case("none") || sel.is_empty() {
-        return Ok(None);
-    }
-    if sel.eq_ignore_ascii_case("default") {
-        let factory = match dir {
-            Direction::Sink => "autoaudiosink",
-            Direction::Source => "autoaudiosrc",
-        };
-        let el = gst::ElementFactory::make(factory).build()?;
-        let ch = if configured_channels > 0 {
-            configured_channels
-        } else {
-            2
-        };
-        return Ok(Some((el, ch)));
-    }
-    let devices = list_devices();
-    let dev = find_device(&devices, dir, sel).ok_or_else(|| {
-        let names: Vec<_> = devices
-            .iter()
-            .filter(|d| d.class.contains(dir.class()))
-            .map(|d| d.name.as_str())
-            .collect();
-        anyhow!(
-            "périphérique audio « {sel} » ({}) introuvable. Disponibles : {}",
-            dir.class(),
-            names.join(", ")
-        )
-    })?;
-    let el = dev.device.create_element(None)?;
-    let ch = if configured_channels > 0 {
-        configured_channels
-    } else {
-        dev.max_channels.unwrap_or(2)
+    let host = cpal::default_host();
+    let mut out = Vec::new();
+    let max_ch = |it: Option<Box<dyn Iterator<Item = cpal::SupportedStreamConfigRange>>>| {
+        it.and_then(|cfgs| cfgs.map(|c| c.channels() as i32).max())
     };
-    info!("audio {:?} : « {} » ({} canaux)", dir, dev.name, ch);
-    Ok(Some((el, ch)))
-}
-
-/// Matrice (out x in) envoyant chaque canal d'entrée vers le canal de sortie
-/// `targets[i]` (1-based). Si moins de cibles que d'entrées, les entrées sont
-/// sommées sur la même cible avec un gain réduit.
-pub fn route_matrix(in_channels: usize, out_channels: usize, targets: &[usize]) -> Vec<Vec<f32>> {
-    let mut m = vec![vec![0.0f32; in_channels]; out_channels];
-    if targets.is_empty() || in_channels == 0 || out_channels == 0 {
-        return m;
-    }
-    let gain = if targets.len() < in_channels {
-        1.0 / in_channels as f32
+    if let Ok(devs) = host.output_devices() {
+        for d in devs {
+            let Ok(name) = d.name() else { continue };
+            let cfgs = d
+                .supported_output_configs()
+                .ok()
+                .map(|c| Box::new(c) as Box<dyn Iterator<Item = _>>);
+            out.push(AudioDevice {
+                name,
+                class: "Audio/Sink".into(),
+                max_channels: max_ch(cfgs),
+            });
+        }
     } else {
-        1.0
-    };
-    for i in 0..in_channels {
-        let t = targets[i % targets.len()];
-        if t >= 1 && t <= out_channels {
-            m[t - 1][i] += gain;
-        } else {
-            warn!("canal de sortie {t} hors limites (1..={out_channels})");
+        warn!("impossible d'énumérer les sorties audio");
+    }
+    if let Ok(devs) = host.input_devices() {
+        for d in devs {
+            let Ok(name) = d.name() else { continue };
+            let cfgs = d
+                .supported_input_configs()
+                .ok()
+                .map(|c| Box::new(c) as Box<dyn Iterator<Item = _>>);
+            out.push(AudioDevice {
+                name,
+                class: "Audio/Source".into(),
+                max_channels: max_ch(cfgs),
+            });
         }
     }
-    m
+    out
 }
 
-/// Matrice (out x in) sélectionnant les canaux d'entrée `sources` (1-based)
-/// vers `out_channels` sorties (stéréo en général).
-pub fn select_matrix(in_channels: usize, out_channels: usize, sources: &[usize]) -> Vec<Vec<f32>> {
-    let mut m = vec![vec![0.0f32; in_channels]; out_channels];
-    if sources.is_empty() || in_channels == 0 {
-        return m;
-    }
-    for (j, row) in m.iter_mut().enumerate() {
-        let s = sources[j % sources.len()];
-        if s >= 1 && s <= in_channels {
-            row[s - 1] = 1.0;
-        } else {
-            warn!("canal d'entrée {s} hors limites (1..={in_channels})");
+// ----------------------------------------------------------------------------------------------
+// Bus d'habillage : somme des sons des vidéos d'habillage → anneau de sortie cpal
+// ----------------------------------------------------------------------------------------------
+
+/// Entrée d'un producteur sur le bus (une par vidéo d'habillage). Le producteur pousse du F32
+/// stéréo entrelacé en avance ; le bus le consomme au rythme réel.
+pub struct BusInput {
+    prod: Mutex<ringbuf::HeapProd<f32>>,
+}
+
+impl BusInput {
+    /// Pousse ce qui tient ; renvoie le nombre d'échantillons acceptés.
+    pub fn push(&self, samples: &[f32]) -> usize {
+        match self.prod.lock() {
+            Ok(mut p) => p.push_slice(samples),
+            Err(_) => 0,
         }
     }
-    m
 }
 
-/// Convertit une matrice en valeur GStreamer pour `audioconvert::mix-matrix`.
-pub fn to_gst_matrix(m: &[Vec<f32>]) -> gst::Array {
-    gst::Array::new(m.iter().map(|row| gst::Array::new(row.iter().copied())))
+/// Mélangeur des sons d'habillage. Un thread cadencé à 10 ms somme les entrées et pousse le
+/// résultat (silence compris) dans l'anneau d'habillage de la sortie cpal — flux continu, donc
+/// l'anneau reste amorcé et l'asservissement de dérive verrouillé. Remplace l'`audiomixer` +
+/// `audiotestsrc` (silence) GStreamer.
+pub struct BrandingBus {
+    inputs: Arc<Mutex<Vec<ringbuf::HeapCons<f32>>>>,
+    sample_rate: u32,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Caps audio brutes pour N canaux. Le masque de canaux est laissé libre :
-/// avec `mix-matrix`, audioconvert ignore les positions et prend celles du périphérique.
-pub fn raw_caps(rate: i32, channels: i32) -> gst::Caps {
-    let mut b = gst::Caps::builder("audio/x-raw")
-        .field("rate", rate)
-        .field("channels", channels);
-    // Au-delà de 2 canaux, on adresse directement les canaux physiques de la carte
-    // (non positionnés) : sans masque, la négociation multicanal échoue avec osxaudiosink.
-    if channels > 2 {
-        b = b.field("channel-mask", gst::Bitmask::new(0));
+impl BrandingBus {
+    pub fn start(pusher: cpal_out::Pusher, sample_rate: u32) -> Self {
+        let inputs: Arc<Mutex<Vec<ringbuf::HeapCons<f32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (inputs_t, stop_t) = (inputs.clone(), stop.clone());
+        let tick = Duration::from_millis(10);
+        let n = (sample_rate as usize / 100).max(1) * 2; // 10 ms stéréo
+        let thread = std::thread::Builder::new()
+            .name("branding-bus".into())
+            .spawn(move || {
+                let mut sum = vec![0f32; n];
+                let mut scratch = vec![0f32; n];
+                let mut next = Instant::now();
+                debug!("bus d'habillage démarré ({sample_rate} Hz, pas de 10 ms)");
+                while !stop_t.load(Ordering::Relaxed) {
+                    sum.iter_mut().for_each(|s| *s = 0.0);
+                    if let Ok(mut ins) = inputs_t.lock() {
+                        for c in ins.iter_mut() {
+                            let got = c.pop_slice(&mut scratch);
+                            for i in 0..got {
+                                sum[i] += scratch[i];
+                            }
+                        }
+                    }
+                    pusher.push(&sum);
+                    next += tick;
+                    let now = Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    } else if now - next > Duration::from_millis(200) {
+                        next = now; // grosse pause (veille…) : on ne rattrape pas
+                    }
+                }
+            })
+            .expect("thread bus d'habillage");
+        Self {
+            inputs,
+            sample_rate,
+            stop,
+            thread: Some(thread),
+        }
     }
-    b.build()
+
+    /// Nouvelle entrée (anneau d'une seconde).
+    pub fn add_input(&self) -> BusInput {
+        let cap = (self.sample_rate as usize * 2).max(4);
+        let (prod, cons) = HeapRb::<f32>::new(cap).split();
+        if let Ok(mut ins) = self.inputs.lock() {
+            ins.push(cons);
+        }
+        BusInput {
+            prod: Mutex::new(prod),
+        }
+    }
 }
 
-/// Sortie audio multicanal via CoreAudio (cpal), car `osxaudiosink` de GStreamer se limite
-/// à 2 canaux sur cette carte. Le graphe GStreamer produit un flux entrelacé F32 à N canaux
-/// (mélange habillage + stream déjà routés) qu'un `appsink` pousse dans un tampon, lu par le
-/// flux CoreAudio.
-#[cfg(target_os = "macos")]
+impl Drop for BrandingBus {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// E/S CoreAudio via cpal : le mixage (stream du téléphone + habillage), le routage vers les
+/// canaux de la carte, les VU-mètres et la sélection des canaux de retour se font dans les
+/// callbacks temps réel, à l'horloge exacte de la carte (une seule horloge, aucun autre framework
+/// n'ouvre le périphérique).
 pub mod cpal_out {
     use anyhow::{anyhow, Result};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -201,8 +170,8 @@ pub mod cpal_out {
 
     type Prod = ringbuf::HeapProd<f32>;
 
-    /// Poignée d'écriture (côté appsink GStreamer). Le consommateur vit dans le thread temps
-    /// réel CoreAudio et lit sans verrou.
+    /// Poignée d'écriture (réseau via libopus, ou bus d'habillage). Le consommateur vit dans le
+    /// thread temps réel CoreAudio et lit sans verrou.
     #[derive(Clone)]
     pub struct Pusher {
         prod: Arc<Mutex<Prod>>,
@@ -332,7 +301,7 @@ pub mod cpal_out {
 
     /// Ouvre le flux CoreAudio de SORTIE et fait le mixage/routage/mètres directement dans le
     /// callback temps réel, à l'horloge exacte de la carte. Deux sources stéréo (stream du
-    /// téléphone et habillage) sont fournies par GStreamer via les `Pusher` renvoyés ; chacune
+    /// téléphone et habillage) sont alimentées via les `Pusher` renvoyés ; chacune
     /// est placée sur ses canaux (`stream_ch`/`branding_ch`, 0-based, modifiables à chaud) et
     /// sommée dans les N canaux de la carte.
     #[allow(clippy::type_complexity)]
@@ -494,7 +463,7 @@ pub mod cpal_out {
     const MAX_DRIFT: f64 = 0.005;
 
     /// Ré-échantillonnage asynchrone = compensation de dérive d'horloge. La source (réseau via
-    /// libopus, ou GStreamer pour l'habillage) et la carte tournent sur deux horloges 48 kHz
+    /// libopus, ou le bus d'habillage à l'horloge murale) et la carte tournent sur deux horloges 48 kHz
     /// indépendantes : sans compensation, l'anneau se vide ou se remplit lentement, jusqu'à la
     /// coupure ou au saut de trames. Ici le rapport de ré-échantillonnage est asservi en douceur
     /// au remplissage de l'anneau (cible ~70 ms) : interpolation linéaire, rapport lissé et borné,
@@ -596,8 +565,8 @@ pub mod cpal_out {
 
     type Cons = ringbuf::HeapCons<f32>;
 
-    /// Lecteur du retour (côté appsrc GStreamer). Le producteur est le thread temps réel
-    /// d'entrée CoreAudio, sans verrou ; ici on lit sous verrou (thread GStreamer, non temps réel).
+    /// Lecteur du retour (côté encodeur Opus). Le producteur est le thread temps réel d'entrée
+    /// CoreAudio, sans verrou ; ici on lit sous verrou (tâche d'encodage, non temps réel).
     #[derive(Clone)]
     pub struct Reader {
         cons: Arc<Mutex<Cons>>,

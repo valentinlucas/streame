@@ -5,7 +5,7 @@
 
 use crate::config::Geometry;
 use crate::engine::{Engine, LayerKind, RenderState, NO_PHONE_TEXT};
-use crate::frame::{with_planes, Frame, FrameSlot, PixelFormat, SurfaceFrame};
+use crate::frame::{FrameSlot, PixelFormat, SurfaceFrame};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -26,7 +26,6 @@ const UNIFORM_SLOT: u64 = 256;
 const MAX_DRAWS: u64 = 2048;
 
 const KIND_RGBA: u32 = 0;
-const KIND_BGRA: u32 = 1;
 const KIND_NV12: u32 = 2;
 const KIND_SOLID: u32 = 3;
 
@@ -106,7 +105,8 @@ struct GpuTex {
     height: u32,
     kind: u32,
     tex0: wgpu::Texture,
-    tex1: Option<wgpu::Texture>,
+    /// Plan UV (NV12) : gardé en vie pour sa vue.
+    _tex1: Option<wgpu::Texture>,
     view0: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     /// Séquence de la dernière image envoyée (sources vidéo).
@@ -521,7 +521,7 @@ impl Renderer {
             height,
             kind,
             tex0,
-            tex1,
+            _tex1: tex1,
             view0,
             bind_group,
             seq: 0,
@@ -606,11 +606,6 @@ impl Renderer {
                 None,
                 KIND_RGBA,
             ),
-            PixelFormat::Rgba => (
-                make(MTLPixelFormat::RGBA8Unorm, wgpu::TextureFormat::Rgba8Unorm, sf.width, sf.height, 0, "iosurface-rgba"),
-                None,
-                KIND_RGBA,
-            ),
         };
         let Some(tex0) = tex0 else { return false };
         if kind == KIND_NV12 && tex1.is_none() {
@@ -688,49 +683,7 @@ impl Renderer {
         {
             return Some(key);
         }
-        let sample = match &frame {
-            Frame::Surface(sf) => {
-                if !self.import_surface(key, sf) {
-                    return None;
-                }
-                if let Some(t) = self.textures.get_mut(&key) {
-                    t.seq = seq;
-                }
-                return Some(key);
-            }
-            Frame::Gst(sample) => sample.clone(),
-        };
-        let uploaded = with_planes(&sample, |p| {
-            let kind = match p.format {
-                PixelFormat::Rgba => KIND_RGBA,
-                PixelFormat::Bgra => KIND_BGRA,
-                PixelFormat::Nv12 => KIND_NV12,
-            };
-            self.ensure_tex(key, p.width, p.height, kind, false);
-            let t = &self.textures[&key];
-            match p.format {
-                PixelFormat::Nv12 => {
-                    if p.data.len() < 2 {
-                        return false;
-                    }
-                    self.write_plane(&t.tex0, p.data[0].0, p.data[0].1, p.width, p.height, 1);
-                    if let Some(uv) = &t.tex1 {
-                        self.write_plane(
-                            uv,
-                            p.data[1].0,
-                            p.data[1].1,
-                            p.width.div_ceil(2),
-                            p.height.div_ceil(2),
-                            2,
-                        );
-                    }
-                }
-                _ => self.write_plane(&t.tex0, p.data[0].0, p.data[0].1, p.width, p.height, 4),
-            }
-            true
-        })
-        .unwrap_or(false);
-        if !uploaded {
+        if !self.import_surface(key, &frame) {
             return None;
         }
         if let Some(t) = self.textures.get_mut(&key) {

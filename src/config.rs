@@ -31,7 +31,7 @@ pub struct ServerConfig {
     pub stun_server: String,
     /// Latence du jitter buffer WebRTC (ms).
     pub rtc_latency_ms: u32,
-    /// Codec vidéo négocié avec le téléphone : "H264" ou "VP8".
+    /// Codec vidéo négocié avec le téléphone : "H264" seulement (décodage matériel VideoToolbox).
     pub video_codec: String,
     /// Profil H264 proposé (SDP `profile-level-id`) : "42e01f" (baseline, universel)
     /// ou "640c1f" (high, meilleure qualité à débit égal sur iPhone récent).
@@ -361,8 +361,10 @@ impl Config {
             "video.width/height/fps invalides"
         );
         match self.server.video_codec.to_ascii_uppercase().as_str() {
-            "H264" | "VP8" => {}
-            other => anyhow::bail!("server.video_codec inconnu : {other} (H264 ou VP8)"),
+            "H264" => {}
+            other => anyhow::bail!(
+                "server.video_codec inconnu : {other} (seul H264 est décodé en matériel)"
+            ),
         }
         if self.multiview.columns == 0 {
             self.multiview.columns = 4;

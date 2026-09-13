@@ -7,9 +7,8 @@ streame, en suivant le même parcours que l'appareil réel (getUserMedia + WebRT
 Pratique pour reproduire les problèmes d'ICE, de signaling, de jitter buffer et de reconnexion
 sans matériel, en boucle.
 
-> Depuis que l'offre met H264 en tête, Chromium négocie lui aussi en **H264** (encodeur logiciel) :
-> le banc exerce donc le même chemin H264 → `vtdec` que l'iPhone. Mettre `video_codec = "VP8"`
-> dans la config de test pour exercer le chemin VP8.
+> L'offre ne propose que H264 : Chromium négocie en **H264** (encodeur logiciel) et le banc exerce
+> donc le même chemin H264 → VideoToolbox → IOSurface que l'iPhone.
 
 ### Installation (une fois)
 
@@ -38,5 +37,8 @@ npm i playwright        # réutilise le Chromium déjà en cache si présent
    - `HOLD` : durée de maintien de chaque connexion (ms)
    - `HEADLESS=0` : afficher la fenêtre du navigateur
 
-3. Observer le log de streame : `chaîne de décodage`, `decodebin : pad ajouté`, `flux … connecté`,
-   `paquets RTP poussés`, et surtout d'éventuelles lignes `pipeline decode-… : <erreur>`.
+3. Observer le log de streame : `piste Video « video/h264 »`, `décodage VideoToolbox (matériel,
+   IOSurface) démarré`, `décodage Opus (libopus) démarré`, `images soumises`, et pour les fichiers
+   d'habillage `vidéo d'habillage « … »` puis `passage terminé (N images, 0 sautées)` à chaque
+   boucle. Une vidéo de test se fabrique avec ffmpeg :
+   `ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=25 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 6 -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 assets/overlay.mp4`.

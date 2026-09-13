@@ -6,12 +6,6 @@ description = "Régie vidéo légère : caméra/son d'un téléphone en WebRTC �
 license = "MIT"
 
 [dependencies]
-# GStreamer (décodage matériel + codecs uniquement ; le transport WebRTC est géré par webrtc-rs)
-gst = { package = "gstreamer", version = "0.25" }
-gst-app = { package = "gstreamer-app", version = "0.25", features = ["v1_20"] }
-gst-video = { package = "gstreamer-video", version = "0.25" }
-gst-audio = { package = "gstreamer-audio", version = "0.25" }
-
 # WebRTC en Rust (crate async `webrtc` + cœur sans-I/O `rtc`) : ICE/DTLS/SRTP/RTP,
 # jitter buffer, TWCC/NACK. Remplace webrtcbin de GStreamer.
 webrtc = "=0.21.0-rc.2"
@@ -52,27 +46,28 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# Sortie audio multicanal directe (CoreAudio) : osxaudiosink de GStreamer se limite à 2 canaux.
+# --- macOS uniquement (chaîne média native : CoreAudio, VideoToolbox, AVFoundation, Metal) ---
+# Sortie/entrée audio multicanal directe (CoreAudio) ; mixage, routage et VU-mètres dans le
+# callback temps réel, à l'horloge de la carte.
 cpal = "0.15"
-# Tampon sans verrou entre GStreamer et le thread temps réel CoreAudio (évite les trous audio).
+# Tampons sans verrou entre les producteurs (réseau, fichiers) et le thread temps réel CoreAudio.
 ringbuf = "0.4"
-# Codec Opus directement en Rust (encode le retour, décode l'audio du téléphone) : plus de
-# GStreamer dans la chaîne audio, un seul saut cpal ↔ codec. Lie la libopus système (brew).
+# Codec Opus en Rust (retour vers le téléphone, décodage du micro du téléphone). Lie la libopus
+# système (brew install opus).
 opus = "0.3"
-# Nom réel des écrans (NSScreen.localizedName) ; mêmes versions que winit.
-objc2-app-kit = { version = "0.2.2", features = ["NSScreen"] }
-objc2-foundation = { version = "0.2.2", features = ["NSString"] }
-# Chaîne vidéo native zéro-copie : VideoToolbox (décodage matériel) → CVPixelBuffer/IOSurface
-# → texture Metal importée dans wgpu ; AVFoundation pour les fichiers d'habillage. Versions
+# Chaîne vidéo native zéro-copie : VideoToolbox (décodage matériel du téléphone) et AVFoundation
+# (fichiers d'habillage) → CVPixelBuffer/IOSurface → texture Metal importée dans wgpu. Versions
 # alignées sur celles de wgpu-hal 30 (objc2 0.6 / frameworks 0.3.2) pour partager les types.
 objc2 = "0.6"
+objc2-foundation = "0.3.2"
+objc2-app-kit = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-core-video = { version = "0.3.2", features = ["objc2-io-surface", "objc2-metal"] }
 objc2-io-surface = "0.3.2"
 objc2-video-toolbox = "0.3.2"
-objc2-av-foundation = "0.3.2"
+objc2-av-foundation = { version = "0.3.2", features = ["objc2-core-media", "objc2-core-video"] }
+objc2-avf-audio = "0.3.2"
 objc2-metal = { version = "0.3.2", features = ["objc2-io-surface"] }
 
 [profile.release]

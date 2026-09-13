@@ -6,6 +6,7 @@
 //! Stream Deck, à la souris (multiview) ou depuis une page web.
 
 mod audio;
+mod avf;
 mod config;
 mod engine;
 mod frame;
@@ -51,8 +52,6 @@ enum Command {
     Init,
     /// Liste les périphériques audio et les écrans détectés.
     Devices,
-    /// Vérifie la présence des plugins GStreamer nécessaires.
-    Check,
 }
 
 fn main() -> Result<()> {
@@ -62,23 +61,14 @@ fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    gst::init().context("initialisation de GStreamer")?;
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     match cli.command {
         Some(Command::Init) => return cmd_init(&cli.config),
-        Some(Command::Check) => return cmd_check(),
         Some(Command::Devices) => return cmd_devices(),
         None => {}
     }
 
-    let missing = engine::check_elements();
-    if !missing.is_empty() {
-        warn!(
-            "éléments GStreamer manquants : {} (brew install gstreamer)",
-            missing.join(", ")
-        );
-    }
     let cfg = Arc::new(if cli.config.is_file() {
         Config::load(&cli.config)?
     } else {
@@ -246,21 +236,6 @@ fn write_demo_lower_third(path: &std::path::Path, w: u32, h: u32) -> Result<()> 
         }
     }
     img.save(path)?;
-    Ok(())
-}
-
-fn cmd_check() -> Result<()> {
-    let missing = engine::check_elements();
-    if missing.is_empty() {
-        println!(
-            "OK : tous les éléments GStreamer nécessaires sont disponibles ({})",
-            gst::version_string()
-        );
-    } else {
-        println!("Éléments GStreamer manquants : {}", missing.join(", "));
-        println!("Sur macOS : brew install gstreamer");
-        std::process::exit(1);
-    }
     Ok(())
 }
 

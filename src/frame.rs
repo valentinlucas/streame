@@ -1,12 +1,10 @@
 //! Échange d'images entre les décodeurs et le rendu : chaque source (téléphone, fichier vidéo)
 //! possède un emplacement contenant la dernière image reçue.
 //!
-//! Deux natures d'image :
-//! - [`Frame::Surface`] : image décodée par VideoToolbox/AVFoundation, adossée à une **IOSurface**
-//!   (mémoire partagée GPU). Le rendu l'importe directement comme texture Metal — **zéro copie**.
-//! - [`Frame::Gst`] : image GStreamer en mémoire système (chemin historique, copiée vers le GPU).
+//! Une image est toujours en **mémoire GPU** : un `CVPixelBuffer` décodé par VideoToolbox
+//! (téléphone) ou AVFoundation (fichiers), adossé à une **IOSurface** que le rendu importe
+//! directement comme texture Metal — zéro copie, le CPU ne touche jamais aux pixels.
 
-use gst_video::prelude::*;
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::{
     kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -21,10 +19,11 @@ use std::time::Instant;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Image décodée en mémoire GPU (IOSurface). Le `CVPixelBuffer` est conservé tant que l'image
-/// est référencée (par l'emplacement ou par une texture importée) : sinon VideoToolbox
+/// est référencée (par l'emplacement ou par une texture importée) : sinon le décodeur
 /// recyclerait le tampon sous les pieds du GPU.
 pub struct SurfaceFrame {
-    pub pixel_buffer: CFRetained<CVPixelBuffer>,
+    /// Gardé en vie pour retenir le tampon (jamais lu directement).
+    _pixel_buffer: CFRetained<CVPixelBuffer>,
     pub surface: CFRetained<IOSurfaceRef>,
     /// Identifiant système de l'IOSurface : stable pour un tampon donné, sert de clé de cache.
     pub surface_id: u32,
@@ -56,7 +55,7 @@ impl SurfaceFrame {
         let width = CVPixelBufferGetWidth(&pixel_buffer) as u32;
         let height = CVPixelBufferGetHeight(&pixel_buffer) as u32;
         Some(Self {
-            pixel_buffer,
+            _pixel_buffer: pixel_buffer,
             surface,
             surface_id,
             width,
@@ -66,17 +65,10 @@ impl SurfaceFrame {
     }
 }
 
-/// Une image prête pour le rendu.
-#[derive(Clone)]
-pub enum Frame {
-    Gst(gst::Sample),
-    Surface(Arc<SurfaceFrame>),
-}
-
 pub struct FrameSlot {
     id: u64,
     seq: AtomicU64,
-    latest: Mutex<Option<Frame>>,
+    latest: Mutex<Option<Arc<SurfaceFrame>>>,
     pub fps: FpsCounter,
 }
 
@@ -100,20 +92,11 @@ impl FrameSlot {
         self.id
     }
 
-    fn store(&self, frame: Frame) {
+    /// Nouvelle image décodée (mémoire GPU, zéro copie).
+    pub fn push(&self, frame: Arc<SurfaceFrame>) {
         *self.latest.lock().unwrap() = Some(frame);
         self.seq.fetch_add(1, Ordering::Release);
         self.fps.tick();
-    }
-
-    /// Image GStreamer (mémoire système).
-    pub fn push(&self, sample: gst::Sample) {
-        self.store(Frame::Gst(sample));
-    }
-
-    /// Image décodée en mémoire GPU (zéro copie).
-    pub fn push_surface(&self, frame: Arc<SurfaceFrame>) {
-        self.store(Frame::Surface(frame));
     }
 
     pub fn clear(&self) {
@@ -125,7 +108,7 @@ impl FrameSlot {
         self.seq.load(Ordering::Acquire)
     }
 
-    pub fn latest(&self) -> Option<(u64, Frame)> {
+    pub fn latest(&self) -> Option<(u64, Arc<SurfaceFrame>)> {
         let seq = self.seq();
         self.latest.lock().unwrap().clone().map(|f| (seq, f))
     }
@@ -133,56 +116,15 @@ impl FrameSlot {
     /// Dimensions de la dernière image (pour les statistiques).
     pub fn dimensions(&self) -> Option<(u32, u32)> {
         let guard = self.latest.lock().unwrap();
-        match guard.as_ref()? {
-            Frame::Surface(s) => Some((s.width, s.height)),
-            Frame::Gst(sample) => {
-                let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
-                Some((info.width(), info.height()))
-            }
-        }
+        guard.as_ref().map(|s| (s.width, s.height))
     }
 }
 
-/// Format des pixels transmis au GPU.
+/// Format des pixels des images décodées.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
-    Rgba,
     Bgra,
     Nv12,
-}
-
-/// Plans d'une image GStreamer mappée en lecture.
-pub struct Planes<'a> {
-    pub width: u32,
-    pub height: u32,
-    pub format: PixelFormat,
-    pub data: Vec<(&'a [u8], u32)>,
-}
-
-/// Mappe un échantillon GStreamer et appelle `f` avec ses plans.
-pub fn with_planes<R>(sample: &gst::Sample, f: impl FnOnce(Planes<'_>) -> R) -> Option<R> {
-    let buffer = sample.buffer()?;
-    let caps = sample.caps()?;
-    let info = gst_video::VideoInfo::from_caps(caps).ok()?;
-    let format = match info.format() {
-        gst_video::VideoFormat::Rgba => PixelFormat::Rgba,
-        gst_video::VideoFormat::Bgra => PixelFormat::Bgra,
-        gst_video::VideoFormat::Nv12 => PixelFormat::Nv12,
-        _ => return None,
-    };
-    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
-    let n = frame.n_planes() as usize;
-    let mut data = Vec::with_capacity(n);
-    for i in 0..n {
-        let d = frame.plane_data(i as u32).ok()?;
-        data.push((d, frame.plane_stride()[i] as u32));
-    }
-    Some(f(Planes {
-        width: info.width(),
-        height: info.height(),
-        format,
-        data,
-    }))
 }
 
 /// Compteur d'images par seconde (mis à jour par `tick`, lu par `value`).

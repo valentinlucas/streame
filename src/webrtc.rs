@@ -2,22 +2,21 @@
 //!
 //! Le Mac est l'« offreur » : il propose un flux audio bidirectionnel (retour vers le
 //! téléphone) et une réception vidéo. webrtc-rs gère ICE/DTLS/SRTP/RTP, le jitter buffer et le
-//! contrôle de congestion (TWCC/NACK) ; GStreamer ne fait plus que décoder et coder :
+//! contrôle de congestion (TWCC/NACK) ; les codecs sont natifs, sans GStreamer :
 //!
 //! ```text
-//!  Téléphone ──RTP──► webrtc-rs (jitter buffer) ──► appsrc(x-rtp) ─► decodebin ─► vtdec ─► GPU
-//!                                                                              └► opusdec ─► cpal
-//!  cpal (Wing) ─► interaudiosrc ─► opusenc ─► appsink ─► TrackLocalStaticSample ─► webrtc-rs ─► RTP ─► Téléphone
+//!  Téléphone ──RTP──► webrtc-rs (jitter buffer) ──► H264 dépaquetisé ─► VideoToolbox ─► IOSurface ─► GPU
+//!                                                └► Opus ─► libopus ─► anneau cpal ─► carte (Wing)
+//!  carte (Wing) ─► cpal ─► libopus ─► TrackLocalStaticSample ─► webrtc-rs ─► RTP ─► Téléphone
 //! ```
 //!
-//! Remplace l'ancien `webrtcbin`. Le contrat vis-à-vis de `server.rs` (`ClientMsg`/`ServerMsg`,
-//! `start`/`set_answer`/`add_ice`/`close`) est conservé ; `start`/`set_answer`/`add_ice` sont
-//! désormais `async` (le signaling tourne déjà dans une tâche Tokio).
+//! Le contrat vis-à-vis de `server.rs` (`ClientMsg`/`ServerMsg`, `start`/`set_answer`/`add_ice`/
+//! `close`) est conservé ; `start`/`set_answer`/`add_ice` sont `async` (le signaling tourne déjà
+//! dans une tâche Tokio).
 
 use crate::config::Config;
-use crate::engine::{frame_appsink, Engine, PhoneStats, RtpStats};
+use crate::engine::{Engine, PhoneStats, RtpStats};
 use anyhow::{Context, Result};
-use gst::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -28,19 +27,18 @@ use tracing::{debug, error, info, warn};
 
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::{JitterBufferBuilder, Registry, Slot};
+use rtc::media::io::sample_builder::SampleBuilder;
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
+use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS};
 use rtc::peer_connection::configuration::RTCOfferOptions;
-use rtc::peer_connection::configuration::media_engine::{
-    MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9,
-};
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
-use rtc::shared::marshal::{Marshal, MarshalSize};
 use rtc::statistics::StatsSelector;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::TrackLocal;
@@ -53,10 +51,6 @@ use webrtc::peer_connection::{
 };
 use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::{default_runtime, Runtime};
-#[cfg(target_os = "macos")]
-use rtc::media::io::sample_builder::SampleBuilder;
-#[cfg(target_os = "macos")]
-use rtc::rtp::codec::h264::H264Packet;
 
 /// Messages téléphone → serveur.
 #[derive(Debug, Clone, Deserialize)]
@@ -122,13 +116,6 @@ pub struct PhoneSession {
     rt: tokio::runtime::Handle,
     /// `close()` ne s'exécute qu'une fois (appelé explicitement puis par `Drop`).
     closed: AtomicBool,
-    /// Un pipeline de décodage **par piste entrante** (audio, vidéo). Chaque piste est isolée :
-    /// deux pistes partageant un seul pipeline se gênaient (l'autoplug de la 2e decodebin
-    /// échouait par intermittence → image OU son manquant selon la piste arrivée en second).
-    decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>>,
-    /// Pipeline GStreamer du son de retour (hors macOS uniquement ; sur macOS le retour est
-    /// encodé en Opus par libopus dans une tâche, sans pipeline).
-    return_pipeline: Option<gst::Pipeline>,
 }
 
 /// Gestionnaire d'événements de la `PeerConnection`.
@@ -136,7 +123,6 @@ pub struct PhoneSession {
 struct Handler {
     engine: Arc<Engine>,
     out: mpsc::UnboundedSender<ServerMsg>,
-    decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>>,
     cancel: CancellationToken,
     name: String,
     /// La PeerConnection elle-même (renseignée après construction) : nécessaire pour relancer
@@ -219,136 +205,38 @@ impl PeerConnectionEventHandler for Handler {
             .as_ref()
             .map(|c| c.clock_rate)
             .unwrap_or(if kind == RtpCodecKind::Audio { 48000 } else { 90000 });
-        let (media, encoding) = rtp_media_encoding(kind, &mime);
-        if media.is_empty() {
-            warn!("piste entrante de type inconnu ({mime}), ignorée");
-            return;
-        }
-        if media == "video" {
-            *self.video_codec.lock().unwrap() = encoding.to_string();
-        }
-        info!("piste {media}/{encoding} du téléphone (ssrc {media_ssrc}, {clock_rate} Hz)");
+        info!("piste {kind:?} « {mime} » du téléphone (ssrc {media_ssrc}, {clock_rate} Hz)");
 
-        // Audio sur macOS : décodage Opus direct (libopus) → mixeur cpal, sans GStreamer.
-        // (La vidéo reste décodée par GStreamer/vtdec ; hors macOS, l'audio aussi.)
-        #[cfg(target_os = "macos")]
-        if media == "audio" {
+        // Audio : décodage Opus direct (libopus) → mixeur cpal.
+        if kind == RtpCodecKind::Audio {
             spawn_opus_decode(track, self.engine.clone(), self.cancel.clone());
             return;
         }
-
-        // Un pipeline dédié par piste (voir PhoneSession::decode_pipelines) : isolation totale,
-        // pas d'interférence entre l'audio et la vidéo au démarrage. Les caps RTP complètes
-        // (fmtp : packetization-mode, profile-level-id, sprop…) sont posées dès la création —
-        // sans elles rtph264depay peut mal réassembler les paquets FU-A de l'iPhone.
-        let fmtp = codec
-            .as_ref()
-            .map(|c| c.sdp_fmtp_line.clone())
-            .unwrap_or_default();
-        let keyframe_needed = Arc::new(AtomicBool::new(false));
-        // Piste conservée pour les demandes d'image-clé (vidéo) ; les boucles ci-dessous
-        // consomment `track`.
-        let pli_track = if media == "video" {
-            Some(track.clone())
-        } else {
-            None
-        };
-        #[cfg(target_os = "macos")]
-        let native_h264 = media == "video" && encoding == "H264";
-        #[cfg(not(target_os = "macos"))]
-        let native_h264 = false;
-        if native_h264 {
-            // Chaîne native zéro-copie : dépaquetisation en Rust → VideoToolbox → IOSurface → GPU.
-            #[cfg(target_os = "macos")]
-            spawn_native_h264(
-                track,
-                self.engine.clone(),
-                self.cancel.clone(),
-                keyframe_needed.clone(),
-                self.av_offset_ms,
-                clock_rate,
-            );
-        } else {
-        let params = DecodeParams {
-            media,
-            encoding,
-            clock_rate,
-            fmtp: &fmtp,
-            av_offset_ms: self.av_offset_ms,
-        };
-        let pipe_name = format!("decode-{}-{media}", self.name.replace(' ', "_"));
-        let appsrc = match build_decode_chain(&pipe_name, &params, &self.engine, keyframe_needed.clone()) {
-            Ok((pipe, appsrc)) => {
-                self.decode_pipelines.lock().unwrap().push(pipe);
-                appsrc
-            }
-            Err(e) => {
-                error!("mise en place du décodage {media}/{encoding} : {e:#}");
-                return;
-            }
-        };
-
-        // Boucle de lecture RTP : les paquets sortent déjà ordonnés/lissés du jitter buffer.
-        let media_owned = media.to_string();
-        let cancel = self.cancel.clone();
-        tokio::spawn(async move {
-            let mut count: u64 = 0u64;
-            loop {
-                let evt = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    evt = track.poll() => evt,
-                };
-                let Some(evt) = evt else {
-                    info!("piste {media_owned} : flux terminé (poll → None)");
-                    break;
-                };
-                match evt {
-                    TrackRemoteEvent::OnRtpPacket(pkt) => {
-                        if count == 0 {
-                            info!("piste {media_owned} : 1er paquet RTP (pt={})", pkt.header.payload_type);
-                        }
-                        let mut bytes = vec![0u8; pkt.marshal_size()];
-                        match pkt.marshal_to(&mut bytes) {
-                            Ok(n) => {
-                                bytes.truncate(n);
-                                let buf = gst::Buffer::from_mut_slice(bytes);
-                                match appsrc.push_buffer(buf) {
-                                    Ok(_) => {
-                                        count += 1;
-                                        if count % 250 == 0 {
-                                            debug!("piste {media_owned} : {count} paquets RTP poussés");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("piste {media_owned} : push appsrc échoué ({e:?})");
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => warn!("RTP marshal : {e}"),
-                        }
-                    }
-                    TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => {
-                        info!("piste {media_owned} : événement {evt:?}");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            let _ = appsrc.end_of_stream();
-        });
+        // Vidéo : seul H264 est offert (décodage matériel VideoToolbox) ; toute autre piste est
+        // ignorée (le navigateur ne devrait pas pouvoir la négocier).
+        if !mime.contains("h264") {
+            warn!("piste vidéo « {mime} » non gérée (H264 attendu), ignorée");
+            return;
         }
+        *self.video_codec.lock().unwrap() = "H264".to_string();
+        let keyframe_needed = Arc::new(AtomicBool::new(false));
+        // Chaîne native zéro-copie : dépaquetisation en Rust → VideoToolbox → IOSurface → GPU.
+        spawn_native_h264(
+            track.clone(),
+            self.engine.clone(),
+            self.cancel.clone(),
+            keyframe_needed.clone(),
+            self.av_offset_ms,
+            clock_rate,
+        );
+        let pli_track = Some(track);
 
-        // Vidéo : demander une image-clé. On envoie un PLI tout de suite (le décodeur a besoin
-        // d'une image-clé + SPS/PPS pour démarrer), puis une petite rafale, puis un rythme lent.
-        // Sans cette rafale initiale, si la 1re image-clé arrive avant que decodebin ne soit prêt,
-        // rtph264depay attend la suivante et l'image met longtemps (ou ne vient pas) — d'où les
-        // démarrages « sans image » qu'on ne récupérait qu'en relançant le stream.
-        // Demandes d'image-clé (PLI) — trois déclencheurs, à la manière d'un récepteur libwebrtc :
-        //  1. **discontinuité** : le dépayloadeur (request-keyframe) a vu une perte que NACK n'a
-        //     pas rattrapée et a émis un ForceKeyUnit vers l'amont → on relaie en PLI, tout de
-        //     suite ; en attendant il jette les images (wait-for-keyframe) : un bref gel plutôt
-        //     qu'une image pixellisée qui se propage ;
+        // Demandes d'image-clé (PLI) — rafale au démarrage (le décodeur a besoin d'une image-clé
+        // + SPS/PPS ; sans elle l'image met longtemps ou ne vient pas), puis trois déclencheurs,
+        // à la manière d'un récepteur libwebrtc :
+        //  1. **discontinuité** : le dépaquetiseur a vu une perte que NACK n'a pas rattrapée, ou
+        //     VideoToolbox a échoué → PLI tout de suite ; en attendant le décodeur jette tout
+        //     jusqu'à l'IDR suivante : un bref gel plutôt qu'une image pixellisée qui se propage ;
         //  2. **famine** : plus aucune image décodée (encodeur relancé, flux muet…) ;
         //  3. **filet de sécurité** périodique et lent (`keyframe_interval_s`, 0 = off) : borne
         //     toute corruption non détectée, pour un coût négligeable (1 image sur ~300 à 10 s).
@@ -385,7 +273,7 @@ impl PeerConnectionEventHandler for Handler {
                     let now = Instant::now();
                     let since = now.duration_since(last_pli);
                     let reason = if keyframe_needed.swap(false, Ordering::Relaxed) && since >= Duration::from_millis(300) {
-                        Some(("discontinuité détectée par le dépayloadeur", true))
+                        Some(("discontinuité (perte ou erreur de décodage)", true))
                     } else if engine.phone_slot().fps.value() <= 0.0 && since >= Duration::from_secs(2) {
                         Some(("plus aucune image décodée", true))
                     } else if interval > 0 && since >= Duration::from_secs(interval as u64) {
@@ -522,13 +410,11 @@ impl PhoneSession {
             .build();
 
         // --- Gestionnaire d'événements --------------------------------------------------------
-        let decode_pipelines: Arc<StdMutex<Vec<gst::Pipeline>>> = Arc::new(StdMutex::new(Vec::new()));
         let video_codec = Arc::new(StdMutex::new(cfg.server.video_codec.to_uppercase()));
         let pc_slot: Arc<StdMutex<Option<Arc<dyn PeerConnection>>>> = Arc::new(StdMutex::new(None));
         let handler = Arc::new(Handler {
             engine: engine.clone(),
             out: out.clone(),
-            decode_pipelines: decode_pipelines.clone(),
             cancel: cancel.clone(),
             name: name.clone(),
             pc: pc_slot.clone(),
@@ -600,41 +486,26 @@ impl PhoneSession {
             )
             .await
             .context("transceiver vidéo")?;
-        // Ordre de préférence des codecs dans l'offre : par défaut webrtc-rs liste VP8 en premier
-        // et un navigateur qui respecte l'ordre (Brave/Chrome, Safari) encode alors en VP8 —
-        // logiciel sur iPhone, et pas de vtdec côté Mac. On met le codec configuré (H264 : encodage
-        // matériel sur le téléphone, décodage matériel VideoToolbox ici) en tête.
-        let prefs = video_codec_preferences(&cfg.server.video_codec);
+        // Codecs de l'offre : H264 seul (par défaut webrtc-rs liste VP8 en premier et un
+        // navigateur qui respecte l'ordre encode alors en VP8, logiciel sur iPhone et sans
+        // décodeur matériel ici). H264 = encodage matériel sur le téléphone, VideoToolbox ici.
+        let prefs = video_codec_preferences(&cfg.server.h264_profile_level_id);
         if let Err(e) = video_tr.set_codec_preferences(prefs).await {
             warn!("préférence de codec vidéo refusée ({e}) : ordre par défaut de webrtc-rs");
         }
 
-        // Son de retour → téléphone. macOS : encodage Opus direct (libopus) depuis l'entrée
-        // carte (cpal), sans GStreamer. Ailleurs : pipeline GStreamer (interaudiosrc → opusenc).
-        #[cfg(target_os = "macos")]
-        let return_pipeline: Option<gst::Pipeline> = {
-            match engine.return_reader() {
-                Some(reader) => spawn_opus_return(
-                    reader,
-                    return_track,
-                    sender,
-                    ssrc,
-                    cfg.server.return_audio_bitrate,
-                    cancel.clone(),
-                ),
-                None => warn!("retour : entrée audio non initialisée, pas de son renvoyé"),
-            }
-            None
-        };
-        #[cfg(not(target_os = "macos"))]
-        let return_pipeline: Option<gst::Pipeline> = {
-            let (pipe, ret_rx) = build_return_pipeline(&cfg).context("pipeline de retour")?;
-            spawn_return_writer(return_track, sender, ssrc, ret_rx, cancel.clone());
-            spawn_bus_watch(&pipe, format!("return-{name}"));
-            pipe.set_state(gst::State::Playing)
-                .context("démarrage du pipeline de retour")?;
-            Some(pipe)
-        };
+        // Son de retour → téléphone : encodage Opus (libopus) depuis l'entrée carte (cpal).
+        match engine.return_reader() {
+            Some(reader) => spawn_opus_return(
+                reader,
+                return_track,
+                sender,
+                ssrc,
+                cfg.server.return_audio_bitrate,
+                cancel.clone(),
+            ),
+            None => warn!("retour : entrée audio non initialisée, pas de son renvoyé"),
+        }
 
         // --- Offre : create-offer → set-local → envoi au téléphone ---------------------------
         let offer = pc.create_offer(None).await.context("create-offer")?;
@@ -658,8 +529,6 @@ impl PhoneSession {
             pc,
             rt: tokio::runtime::Handle::current(),
             closed: AtomicBool::new(false),
-            decode_pipelines,
-            return_pipeline,
         }))
     }
 
@@ -691,31 +560,15 @@ impl PhoneSession {
         }
     }
 
-    /// Ferme la session. Idempotent et **non bloquant** : les arrêts GStreamer (`set_state(Null)`
-    /// attend la fin des threads de flux, parfois des centaines de ms avec VideoToolbox) sont
-    /// faits sur un thread dédié, jamais sur un worker Tokio — un worker bloqué, c'est un
-    /// serveur qui ne répond plus. La PeerConnection est fermée sur le runtime média.
+    /// Ferme la session. Idempotent et **non bloquant** : les tâches (RTP, décodage, retour)
+    /// s'arrêtent par le jeton d'annulation, la PeerConnection est fermée sur le runtime média —
+    /// jamais d'attente sur un worker Tokio (un worker bloqué, c'est un serveur qui ne répond
+    /// plus).
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
         self.cancel.cancel();
-        let mut pipes: Vec<gst::Pipeline> = self.decode_pipelines.lock().unwrap().clone();
-        if let Some(rp) = &self.return_pipeline {
-            pipes.push(rp.clone());
-        }
-        let name = self.name.clone();
-        let _ = std::thread::Builder::new()
-            .name("gst-teardown".into())
-            .spawn(move || {
-                for pipe in &pipes {
-                    if let Some(b) = pipe.bus() {
-                        b.set_flushing(true); // débloque le thread de surveillance (iter_timed)
-                    }
-                    let _ = pipe.set_state(gst::State::Null);
-                }
-                debug!("session « {name} » : {} pipeline(s) GStreamer arrêté(s)", pipes.len());
-            });
         let pc = self.pc.clone();
         self.rt.spawn(async move {
             let _ = pc.close().await;
@@ -729,37 +582,12 @@ impl Drop for PhoneSession {
     }
 }
 
-/// Journalise les erreurs/avertissements d'un pipeline GStreamer sur un thread dédié.
-fn spawn_bus_watch(pipeline: &gst::Pipeline, name: String) {
-    let Some(bus) = pipeline.bus() else { return };
-    let _ = std::thread::Builder::new()
-        .name(format!("bus-{name}"))
-        .spawn(move || {
-            for msg in bus.iter_timed(gst::ClockTime::NONE) {
-                use gst::MessageView;
-                match msg.view() {
-                    MessageView::Error(e) => {
-                        let src = e.src().map(|s| s.path_string().to_string()).unwrap_or_default();
-                        error!("pipeline {name} : {} [{src}] ({:?})", e.error(), e.debug());
-                    }
-                    MessageView::Warning(w) => {
-                        warn!("pipeline {name} : {} ({:?})", w.error(), w.debug());
-                    }
-                    MessageView::Eos(_) => {
-                        info!("pipeline {name} : fin de flux");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
-}
-
-/// Liste ordonnée des codecs vidéo à offrir, le codec configuré en tête. Les paramètres
-/// (fmtp, types de charge utile) reprennent ceux enregistrés par `register_default_codecs`,
-/// sinon la préférence est refusée. Variantes H264 en `packetization-mode=1` (celle des iPhone)
-/// d'abord ; VP8/VP9 gardés en repli pour un navigateur sans H264 (Chromium de test, par ex.).
-fn video_codec_preferences(preferred: &str) -> Vec<RTCRtpCodecParameters> {
+/// Codecs vidéo offerts : **H264 uniquement**, en `packetization-mode=1` (celui des iPhone),
+/// le profil configuré en tête. Le décodage est matériel (VideoToolbox), qui ne gère ni VP8 ni
+/// VP9 : les proposer reviendrait à risquer une négociation sans image. Les paramètres (fmtp,
+/// types de charge utile) reprennent ceux enregistrés par `register_default_codecs`, sinon la
+/// préférence est refusée.
+fn video_codec_preferences(profile_level_id: &str) -> Vec<RTCRtpCodecParameters> {
     let fb = || {
         vec![
             RTCPFeedback { typ: "goog-remb".into(), parameter: String::new() },
@@ -769,9 +597,9 @@ fn video_codec_preferences(preferred: &str) -> Vec<RTCRtpCodecParameters> {
             RTCPFeedback { typ: "transport-cc".into(), parameter: String::new() },
         ]
     };
-    let codec = |mime: &str, fmtp: &str, pt: u8| RTCRtpCodecParameters {
+    let codec = |fmtp: &str, pt: u8| RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
-            mime_type: mime.to_owned(),
+            mime_type: MIME_TYPE_H264.to_owned(),
             clock_rate: 90000,
             channels: 0,
             sdp_fmtp_line: fmtp.to_owned(),
@@ -779,412 +607,23 @@ fn video_codec_preferences(preferred: &str) -> Vec<RTCRtpCodecParameters> {
         },
         payload_type: pt,
     };
-    let h264 = [
-        codec(MIME_TYPE_H264, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", 125),
-        codec(MIME_TYPE_H264, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f", 102),
-        codec(MIME_TYPE_H264, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032", 123),
+    let mut out = vec![
+        codec("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", 125),
+        codec("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f", 102),
+        codec("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032", 123),
     ];
-    let vp8 = [codec(MIME_TYPE_VP8, "", 96)];
-    let vp9 = [codec(MIME_TYPE_VP9, "profile-id=0", 98)];
-    let mut out = Vec::new();
-    match preferred.to_ascii_uppercase().as_str() {
-        "VP8" => {
-            out.extend(vp8);
-            out.extend(h264);
-            out.extend(vp9);
-        }
-        "VP9" => {
-            out.extend(vp9);
-            out.extend(h264);
-            out.extend(vp8);
-        }
-        _ => {
-            out.extend(h264);
-            out.extend(vp8);
-            out.extend(vp9);
-        }
+    let wanted = profile_level_id.trim().to_ascii_lowercase();
+    if let Some(i) = out
+        .iter()
+        .position(|c| c.rtp_codec.sdp_fmtp_line.ends_with(&format!("profile-level-id={wanted}")))
+    {
+        let first = out.remove(i);
+        out.insert(0, first);
     }
     out
 }
 
-/// `(media, encoding-name)` GStreamer pour un type MIME webrtc-rs (ex. « video/h264 »).
-fn rtp_media_encoding(kind: RtpCodecKind, mime: &str) -> (&'static str, &'static str) {
-    let m = mime;
-    if kind == RtpCodecKind::Audio || m.contains("opus") {
-        return ("audio", "OPUS");
-    }
-    if m.contains("h264") {
-        ("video", "H264")
-    } else if m.contains("h265") || m.contains("hevc") {
-        ("video", "H265")
-    } else if m.contains("vp9") {
-        ("video", "VP9")
-    } else if m.contains("vp8") {
-        ("video", "VP8")
-    } else if m.contains("av1") {
-        ("video", "AV1")
-    } else if kind == RtpCodecKind::Video {
-        ("video", "H264")
-    } else {
-        ("", "")
-    }
-}
-
-/// Paramètres d'une piste entrante pour construire sa chaîne de décodage.
-struct DecodeParams<'a> {
-    media: &'a str,
-    encoding: &'a str,
-    clock_rate: u32,
-    /// Ligne fmtp négociée (`packetization-mode=1;profile-level-id=…`), reportée dans les caps.
-    fmtp: &'a str,
-    /// Retard d'affichage de la vidéo pour l'aligner sur l'audio (0 = au plus tôt).
-    av_offset_ms: u32,
-}
-
-/// Renvoie le premier élément GStreamer disponible parmi des candidats (décodeur matériel
-/// d'abord, logiciel en repli).
-fn make_first(names: &[&str]) -> Result<gst::Element> {
-    for n in names {
-        if let Ok(e) = gst::ElementFactory::make(n).build() {
-            return Ok(e);
-        }
-    }
-    Err(anyhow::anyhow!("aucun élément GStreamer disponible parmi {names:?}"))
-}
-
-/// Dépayloadeur RTP configuré pour la résilience : sur une discontinuité (perte non rattrapée
-/// par NACK) il émet un ForceKeyUnit vers l'amont — relayé en PLI par la boucle de la piste —
-/// et jette les images jusqu'à la prochaine image-clé (bref gel plutôt qu'image corrompue).
-/// Propriétés disponibles à partir de GStreamer 1.20 ; ignorées sinon.
-fn make_depay(name: &str) -> Result<gst::Element> {
-    let el = gst::ElementFactory::make(name).build()?;
-    for prop in ["request-keyframe", "wait-for-keyframe"] {
-        if el.has_property(prop) {
-            el.set_property(prop, true);
-        }
-    }
-    Ok(el)
-}
-
-/// Construit un **pipeline dédié** pour une piste entrante et le démarre.
-///
-/// Vidéo : chaîne **explicite** `appsrc(x-rtp) → dépay → parseur → décodeur (VideoToolbox) →
-/// queue → videoconvert → GPU`, câblée en entier avant le passage en PLAYING — déterministe,
-/// sans l'autoplug ni la `multiqueue` de decodebin (quelques dizaines de ms de moins). Les caps
-/// RTP complètes sont posées dès la création. Si `av_offset_ms` > 0, le sink est synchronisé
-/// sur l'horloge avec cette latence : chaque image est affichée `av_offset_ms` après son
-/// arrivée, ce qui l'aligne sur le son (dont la lecture est tamponnée d'autant).
-/// Codec non prévu : repli sur decodebin (autoplug).
-fn build_decode_chain(
-    name: &str,
-    p: &DecodeParams<'_>,
-    engine: &Arc<Engine>,
-    keyframe_needed: Arc<AtomicBool>,
-) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
-    let pipe = gst::Pipeline::with_name(name);
-
-    let mut cb = gst::Caps::builder("application/x-rtp")
-        .field("media", p.media)
-        .field("encoding-name", p.encoding)
-        .field("clock-rate", p.clock_rate as i32);
-    for kv in p.fmtp.split(';') {
-        if let Some((k, v)) = kv.split_once('=') {
-            let (k, v) = (k.trim(), v.trim());
-            if !k.is_empty() && !v.is_empty() {
-                cb = cb.field(k, v);
-            }
-        }
-    }
-    let caps = cb.build();
-    let is_video = p.media == "video";
-    let offset_ns = if is_video {
-        p.av_offset_ms as i64 * 1_000_000
-    } else {
-        0
-    };
-    let appsrc = gst_app::AppSrc::builder()
-        .caps(&caps)
-        .is_live(true)
-        .format(gst::Format::Time)
-        .do_timestamp(true)
-        .min_latency(offset_ns)
-        .max_latency(offset_ns)
-        .build();
-    let src: gst::Element = appsrc.clone().upcast();
-
-    // Relais des demandes d'image-clé du dépayloadeur (événement amont ForceKeyUnit).
-    if let Some(pad) = src.static_pad("src") {
-        let flag = keyframe_needed;
-        pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
-            if let Some(gst::PadProbeData::Event(ev)) = &info.data {
-                if gst_video::UpstreamForceKeyUnitEvent::parse(ev).is_ok() {
-                    flag.store(true, Ordering::Relaxed);
-                }
-            }
-            gst::PadProbeReturn::Ok
-        });
-    }
-
-    let mut chain: Vec<gst::Element> = vec![src.clone()];
-    let explicit = match (is_video, p.encoding) {
-        (true, "H264") => {
-            chain.push(make_depay("rtph264depay")?);
-            chain.push(gst::ElementFactory::make("h264parse").build()?);
-            chain.push(make_first(&["vtdec_hw", "vtdec", "avdec_h264"])?);
-            true
-        }
-        (true, "H265") => {
-            chain.push(make_depay("rtph265depay")?);
-            chain.push(gst::ElementFactory::make("h265parse").build()?);
-            chain.push(make_first(&["vtdec_hw", "vtdec", "avdec_h265"])?);
-            true
-        }
-        (true, "VP8") => {
-            chain.push(make_depay("rtpvp8depay")?);
-            chain.push(make_first(&["vp8dec", "avdec_vp8"])?);
-            true
-        }
-        (true, "VP9") => {
-            chain.push(make_depay("rtpvp9depay")?);
-            chain.push(make_first(&["vp9dec", "vtdec_hw", "vtdec", "avdec_vp9"])?);
-            true
-        }
-        _ => false,
-    };
-
-    if !explicit {
-        // Repli générique (audio hors macOS, codec inconnu) : decodebin auto-branche.
-        let decode = gst::ElementFactory::make("decodebin").build()?;
-        pipe.add_many([&src, &decode])?;
-        src.link(&decode)?;
-        let engine2 = engine.clone();
-        let pipe2 = pipe.clone();
-        decode.connect_pad_added(move |_, dpad| {
-            if let Err(e) = attach_decoded_branch(&pipe2, dpad, &engine2) {
-                error!("branche de décodage : {e:#}");
-            }
-        });
-    } else {
-        // Découple le décodeur de l'attente de synchronisation du sink ; jette les images en
-        // retard plutôt que d'accumuler.
-        let q = gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 3u32)
-            .property("max-size-time", 0u64)
-            .property("max-size-bytes", 0u32)
-            .property_from_str("leaky", "downstream")
-            .build()?;
-        chain.push(q);
-        chain.push(gst::ElementFactory::make("videoconvert").build()?);
-        chain.push(
-            gst::ElementFactory::make("capsfilter")
-                .property("caps", crate::engine::gpu_caps())
-                .build()?,
-        );
-        chain.push(frame_appsink(engine.phone_slot().clone(), offset_ns > 0).upcast());
-        let refs: Vec<&gst::Element> = chain.iter().collect();
-        pipe.add_many(&refs)?;
-        gst::Element::link_many(&refs)?;
-        info!(
-            "chaîne vidéo {} câblée ({} éléments, décodeur {}, retard A/V {} ms)",
-            p.encoding,
-            chain.len(),
-            chain[3].factory().map(|f| f.name().to_string()).unwrap_or_default(),
-            p.av_offset_ms
-        );
-    }
-
-    spawn_bus_watch(&pipe, name.to_string());
-    pipe.set_state(gst::State::Playing)
-        .with_context(|| format!("démarrage du pipeline de décodage « {name} »"))?;
-    Ok((pipe, appsrc))
-}
-
-/// Construit la branche de décodage à partir d'un pad `decodebin` (repli codec inconnu).
-fn attach_decoded_branch(pipe: &gst::Pipeline, dpad: &gst::Pad, engine: &Arc<Engine>) -> Result<()> {
-    let Some(caps) = dpad.current_caps() else {
-        return Ok(());
-    };
-    let Some(s) = caps.structure(0) else {
-        return Ok(());
-    };
-    let media = s.name().to_string();
-    info!("decodebin : pad ajouté, caps décodées = {caps}");
-    let q = gst::ElementFactory::make("queue")
-        .property("max-size-buffers", 2u32)
-        .property("max-size-time", 0u64)
-        .property("max-size-bytes", 0u32)
-        .property_from_str("leaky", "downstream")
-        .build()?;
-    let chain: Vec<gst::Element> = if media.starts_with("video/") {
-        // Décodé (vtdec → NV12) puis envoyé tel quel au GPU, sans synchronisation : le jitter
-        // buffer webrtc-rs a déjà lissé le flux, on affiche au plus tôt.
-        let conv = gst::ElementFactory::make("videoconvert").build()?;
-        let cf = gst::ElementFactory::make("capsfilter")
-            .property("caps", crate::engine::gpu_caps())
-            .build()?;
-        let sink = frame_appsink(engine.phone_slot().clone(), false);
-        vec![q, conv, cf, sink.upcast()]
-    } else if media.starts_with("audio/") {
-        // Le son décodé (F32 stéréo 48 kHz) est poussé dans le moteur (mixage cpal).
-        let conv = gst::ElementFactory::make("audioconvert").build()?;
-        let res = gst::ElementFactory::make("audioresample").build()?;
-        let caps = gst::Caps::builder("audio/x-raw")
-            .field("format", "F32LE")
-            .field("layout", "interleaved")
-            .field("rate", 48000i32)
-            .field("channels", 2i32)
-            .build();
-        let cf = gst::ElementFactory::make("capsfilter")
-            .property("caps", &caps)
-            .build()?;
-        let sink = gst_app::AppSink::builder()
-            .caps(&caps)
-            .sync(false)
-            .max_buffers(4)
-            .drop(true)
-            .build();
-        let eng = engine.clone();
-        sink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_sample(move |s| {
-                    let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    if let Some(buf) = sample.buffer_owned() {
-                        eng.push_phone_audio(buf);
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
-        vec![q, conv, res, cf, sink.upcast()]
-    } else {
-        return Ok(());
-    };
-    let refs: Vec<&gst::Element> = chain.iter().collect();
-    pipe.add_many(&refs)?;
-    gst::Element::link_many(&refs)?;
-    for el in &chain {
-        el.sync_state_with_parent()?;
-    }
-    dpad.link(&chain[0].static_pad("sink").unwrap())?;
-    info!("flux {media} du téléphone connecté");
-    Ok(())
-}
-
-/// Pipeline du son de retour (repli hors macOS) : `interaudiosrc` (alimenté par cpal) → Opus →
-/// `appsink`. Renvoie le pipeline et le récepteur des trames Opus (données + durée).
-#[cfg(not(target_os = "macos"))]
-fn build_return_pipeline(cfg: &Config) -> Result<(gst::Pipeline, mpsc::UnboundedReceiver<(bytes::Bytes, Duration)>)> {
-    let pipeline = gst::Pipeline::with_name("phone-return");
-    let src = gst::ElementFactory::make("interaudiosrc")
-        .property("channel", crate::engine::RETURN_AUDIO_CHANNEL)
-        .build()?;
-    let convert = gst::ElementFactory::make("audioconvert").build()?;
-    let resample = gst::ElementFactory::make("audioresample").build()?;
-    let cf = gst::ElementFactory::make("capsfilter")
-        .property(
-            "caps",
-            gst::Caps::builder("audio/x-raw")
-                .field("rate", 48000i32)
-                .field("channels", 2i32)
-                .build(),
-        )
-        .build()?;
-    let enc = gst::ElementFactory::make("opusenc")
-        .property("bitrate", cfg.server.return_audio_bitrate)
-        .property_from_str("audio-type", "voice")
-        .build()?;
-    let opus_caps = gst::Caps::builder("audio/x-opus").build();
-    let sink = gst_app::AppSink::builder()
-        .caps(&opus_caps)
-        .sync(false)
-        .max_buffers(16)
-        .drop(false)
-        .build();
-
-    let (tx, rx) = mpsc::unbounded_channel::<(bytes::Bytes, Duration)>();
-    sink.set_callbacks(
-        gst_app::AppSinkCallbacks::builder()
-            .new_sample(move |s| {
-                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                if let Some(buf) = sample.buffer() {
-                    let dur = buf
-                        .duration()
-                        .map(|d| Duration::from_nanos(d.nseconds()))
-                        .unwrap_or(Duration::from_millis(20));
-                    if let Ok(map) = buf.map_readable() {
-                        let _ = tx.send((bytes::Bytes::copy_from_slice(map.as_slice()), dur));
-                    }
-                }
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
-
-    let sink_el: gst::Element = sink.upcast();
-    pipeline.add_many([&src, &convert, &resample, &cf, &enc, &sink_el])?;
-    gst::Element::link_many([&src, &convert, &resample, &cf, &enc, &sink_el])?;
-    Ok((pipeline, rx))
-}
-
-/// Écrit les trames Opus de retour sur la piste locale une fois le type de charge utile négocié
-/// (repli hors macOS ; sur macOS l'encodage est fait directement par [`spawn_opus_return`]).
-#[cfg(not(target_os = "macos"))]
-fn spawn_return_writer(
-    track: Arc<TrackLocalStaticSample>,
-    sender: Arc<dyn RtpSender>,
-    ssrc: u32,
-    mut rx: mpsc::UnboundedReceiver<(bytes::Bytes, Duration)>,
-    cancel: CancellationToken,
-) {
-    // Le type de charge utile n'est connu qu'après négociation : on le résout en tâche de fond.
-    let pt_slot = Arc::new(StdMutex::new(None::<u8>));
-    {
-        let sender = sender.clone();
-        let pt_slot = pt_slot.clone();
-        let cancel = cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                if let Ok(params) = sender.get_parameters().await {
-                    if let Some(codec) = params.rtp_parameters.codecs.first() {
-                        *pt_slot.lock().unwrap() = Some(codec.payload_type);
-                        return;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-        });
-    }
-    tokio::spawn(async move {
-        while let Some((data, duration)) = rx.recv().await {
-            if cancel.is_cancelled() {
-                break;
-            }
-            // Tant que la négociation n'est pas finie, il n'y a rien à envoyer : on jette.
-            let Some(pt) = *pt_slot.lock().unwrap() else {
-                continue;
-            };
-            let sample = Sample {
-                data,
-                duration,
-                ..Sample::new(Instant::now())
-            };
-            if track
-                .sample_writer(ssrc, pt)
-                .write_sample(&sample)
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-}
-
 /// Attend que le type de charge utile de l'émetteur soit négocié (après la réponse SDP).
-#[cfg(target_os = "macos")]
 async fn resolve_payload_type(
     sender: &Arc<dyn RtpSender>,
     cancel: &CancellationToken,
@@ -1205,10 +644,9 @@ async fn resolve_payload_type(
     }
 }
 
-/// macOS : décode l'audio Opus entrant du téléphone avec libopus et le pousse dans le mixeur
+/// Décode l'audio Opus entrant du téléphone avec libopus et le pousse dans le mixeur
 /// cpal (F32 stéréo 48 kHz). Les paquets sortent déjà ordonnés du jitter buffer webrtc-rs ;
 /// un paquet RTP Opus = une trame Opus (RFC 7587), donc pas de réassemblage.
-#[cfg(target_os = "macos")]
 fn spawn_opus_decode(track: Arc<dyn TrackRemote>, engine: Arc<Engine>, cancel: CancellationToken) {
     tokio::spawn(async move {
         let mut dec = match opus::Decoder::new(48000, opus::Channels::Stereo) {
@@ -1279,9 +717,8 @@ fn spawn_opus_decode(track: Arc<dyn TrackRemote>, engine: Arc<Engine>, cancel: C
     });
 }
 
-/// macOS : encode le retour de la carte (entrée cpal, F32 stéréo 48 kHz) en Opus avec libopus
+/// Encode le retour de la carte (entrée cpal, F32 stéréo 48 kHz) en Opus avec libopus
 /// et l'écrit sur la piste locale webrtc-rs, sans GStreamer. Cadence 20 ms.
-#[cfg(target_os = "macos")]
 fn spawn_opus_return(
     reader: crate::audio::cpal_out::Reader,
     track: Arc<TrackLocalStaticSample>,
@@ -1350,11 +787,10 @@ fn spawn_opus_return(
     });
 }
 
-/// macOS : vidéo H264 du téléphone en natif, sans GStreamer. Les paquets RTP (déjà ordonnés par
+/// Vidéo H264 du téléphone en natif, sans GStreamer. Les paquets RTP (déjà ordonnés par
 /// le jitter buffer) sont réassemblés en unités d'accès par le `SampleBuilder` de webrtc-rs,
 /// décodés en matériel par VideoToolbox (`vt.rs`) et livrés au rendu en IOSurface (zéro copie).
 /// Une tâche de présentation applique le retard de lip-sync (`av_offset_ms`).
-#[cfg(target_os = "macos")]
 fn spawn_native_h264(
     track: Arc<dyn TrackRemote>,
     engine: Arc<Engine>,
@@ -1378,7 +814,7 @@ fn spawn_native_h264(
                 if !offset.is_zero() {
                     tokio::time::sleep_until(tokio::time::Instant::from_std(arrived + offset)).await;
                 }
-                engine.phone_slot().push_surface(frame);
+                engine.phone_slot().push(frame);
             }
         });
     }
