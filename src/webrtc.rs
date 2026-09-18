@@ -146,6 +146,8 @@ struct Handler {
     av_offset_ms: u32,
     /// Image-clé de sécurité périodique (s), 0 = désactivée.
     keyframe_interval_s: u32,
+    /// Débit vidéo de départ annoncé au téléphone (kb/s), 0 = non annoncé.
+    video_start_bitrate_kbps: u32,
 }
 
 #[async_trait::async_trait]
@@ -228,20 +230,22 @@ impl PeerConnectionEventHandler for Handler {
         }
         *self.video_codec.lock().unwrap() = "H264".to_string();
         let keyframe_needed = Arc::new(AtomicBool::new(false));
+        let decoded = Arc::new(AtomicBool::new(false));
         // Chaîne native zéro-copie : dépaquetisation en Rust → VideoToolbox → IOSurface → GPU.
         spawn_native_h264(
             track.clone(),
             self.engine.clone(),
             self.cancel.clone(),
             keyframe_needed.clone(),
+            decoded.clone(),
             self.av_offset_ms,
             clock_rate,
         );
         let pli_track = Some(track);
 
-        // Demandes d'image-clé (PLI) — rafale au démarrage (le décodeur a besoin d'une image-clé
-        // + SPS/PPS ; sans elle l'image met longtemps ou ne vient pas), puis trois déclencheurs,
-        // à la manière d'un récepteur libwebrtc :
+        // Demandes d'image-clé (PLI) — une au démarrage, répétée tant que rien n'est décodé (le
+        // décodeur a besoin d'une image-clé + SPS/PPS), puis trois déclencheurs, à la manière
+        // d'un récepteur libwebrtc :
         //  1. **discontinuité** : le dépaquetiseur a vu une perte que NACK n'a pas rattrapée, ou
         //     VideoToolbox a échoué → PLI tout de suite ; en attendant le décodeur jette tout
         //     jusqu'à l'IDR suivante : un bref gel plutôt qu'une image pixellisée qui se propage ;
@@ -262,14 +266,21 @@ impl PeerConnectionEventHandler for Handler {
                     };
                     t.write_rtcp(vec![Box::new(pli)]).await.is_ok()
                 };
-                // Rafale de démarrage (le décodeur a besoin d'une image-clé + SPS/PPS).
-                for _ in 0..6 {
+                // Démarrage : une demande, répétée toutes les 500 ms tant qu'aucune image n'a été
+                // décodée (10 essais au plus). Pas de rafale inconditionnelle : chaque PLI coûte
+                // une image-clé 1080p au téléphone alors que son estimation de débit part de
+                // ~300 kb/s ; six d'affilée engorgeaient son pacer et retardaient la montée en
+                // débit de plusieurs dizaines de secondes.
+                for _ in 0..10 {
+                    if decoded.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if !send_pli(pli_track.clone()).await {
                         return;
                     }
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = tokio::time::sleep(Duration::from_millis(400)) => {}
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                     }
                 }
                 let mut last_pli = Instant::now();
@@ -329,6 +340,7 @@ impl Handler {
         let connected = self.connected.clone();
         let engine = self.engine.clone();
         let name = self.name.clone();
+        let start_kbps = self.video_start_bitrate_kbps;
         // Hors du callback (le pilote de la connexion nous appelle) : dans une tâche.
         tokio::spawn(async move {
             let opts = RTCOfferOptions {
@@ -350,7 +362,8 @@ impl Handler {
             }
             match pc.local_description().await {
                 Some(local) => {
-                    let _ = out.send(ServerMsg::Offer { sdp: local.sdp });
+                    let sdp = announce_start_bitrate(&local.sdp, start_kbps);
+                    let _ = out.send(ServerMsg::Offer { sdp });
                 }
                 None => {
                     cancel.cancel();
@@ -427,6 +440,7 @@ impl PhoneSession {
             video_codec: video_codec.clone(),
             av_offset_ms: cfg.video.av_offset_ms,
             keyframe_interval_s: cfg.server.keyframe_interval_s,
+            video_start_bitrate_kbps: cfg.server.video_start_bitrate_kbps,
         });
 
         // --- PeerConnection -------------------------------------------------------------------
@@ -517,8 +531,9 @@ impl PhoneSession {
             .await
             .context("set-local-description")?;
         if let Some(local) = pc.local_description().await {
-            debug!("offre SDP envoyée :\n{}", local.sdp);
-            let _ = out.send(ServerMsg::Offer { sdp: local.sdp });
+            let sdp = announce_start_bitrate(&local.sdp, cfg.server.video_start_bitrate_kbps);
+            debug!("offre SDP envoyée :\n{sdp}");
+            let _ = out.send(ServerMsg::Offer { sdp });
         } else {
             warn!("offre locale absente après set-local-description");
         }
@@ -590,7 +605,8 @@ impl Drop for PhoneSession {
 /// le profil configuré en tête. Le décodage est matériel (VideoToolbox), qui ne gère ni VP8 ni
 /// VP9 : les proposer reviendrait à risquer une négociation sans image. Les paramètres (fmtp,
 /// types de charge utile) reprennent ceux enregistrés par `register_default_codecs`, sinon la
-/// préférence est refusée.
+/// préférence est refusée (et la ligne fmtp de l'offre est celle du codec enregistré, d'où
+/// l'ajout de `x-google-start-bitrate` par [`announce_start_bitrate`] sur le texte envoyé).
 fn video_codec_preferences(profile_level_id: &str) -> Vec<RTCRtpCodecParameters> {
     let fb = || {
         vec![
@@ -619,10 +635,37 @@ fn video_codec_preferences(profile_level_id: &str) -> Vec<RTCRtpCodecParameters>
     let wanted = profile_level_id.trim().to_ascii_lowercase();
     if let Some(i) = out
         .iter()
-        .position(|c| c.rtp_codec.sdp_fmtp_line.ends_with(&format!("profile-level-id={wanted}")))
+        .position(|c| c.rtp_codec.sdp_fmtp_line.contains(&format!("profile-level-id={wanted}")))
     {
         let first = out.remove(i);
         out.insert(0, first);
+    }
+    out
+}
+
+/// Ajoute `x-google-start-bitrate=<kb/s>` aux lignes fmtp H264 de l'offre **envoyée au
+/// téléphone**. libwebrtc (Chrome, Safari) lit ce paramètre dans la description distante et
+/// démarre son encodeur à ce débit au lieu de 300 kb/s, ce qui évite ~30 s de montée à cadence
+/// dégradée. Seul le texte transmis est modifié : la description locale de webrtc-rs reste
+/// telle quelle (le paramètre ne concerne que l'encodeur distant) et la réponse du téléphone
+/// ne le reprend pas. `kbps` = 0 → texte inchangé.
+fn announce_start_bitrate(sdp: &str, kbps: u32) -> String {
+    if kbps == 0 {
+        return sdp.to_string();
+    }
+    let mut out = String::with_capacity(sdp.len() + 64);
+    for line in sdp.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        if body.starts_with("a=fmtp:")
+            && body.contains("profile-level-id=")
+            && !body.contains("x-google-start-bitrate=")
+        {
+            out.push_str(body);
+            out.push_str(&format!(";x-google-start-bitrate={kbps}"));
+            out.push_str(&line[body.len()..]);
+        } else {
+            out.push_str(line);
+        }
     }
     out
 }
@@ -807,6 +850,7 @@ fn spawn_native_h264(
     engine: Arc<Engine>,
     cancel: CancellationToken,
     keyframe_needed: Arc<AtomicBool>,
+    decoded: Arc<AtomicBool>,
     av_offset_ms: u32,
     clock_rate: u32,
 ) {
@@ -876,6 +920,7 @@ fn spawn_native_h264(
                             crate::vt::Outcome::Ok => {
                                 if !started {
                                     started = true;
+                                    decoded.store(true, Ordering::Relaxed);
                                     info!("vidéo : décodage VideoToolbox (matériel, IOSurface) démarré");
                                 }
                                 waiting_idr = false;
@@ -973,7 +1018,8 @@ fn spawn_stats(
                 packets_received: received,
                 packets_lost: recv.packets_lost,
                 loss_percent,
-                jitter_ms: (recv.jitter * 1000.0) as f32,
+                // `jitter` est en unités d'horodatage RTP (RFC 3550), 90 kHz pour la vidéo.
+                jitter_ms: (recv.jitter / 90.0) as f32,
                 nack_count: inbound.nack_count,
                 pli_count: inbound.pli_count,
                 rtt_ms: None,
@@ -985,6 +1031,20 @@ fn spawn_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debit_de_depart_annonce_sur_les_fmtp_h264() {
+        let sdp = "m=video 9 UDP/TLS/RTP/SAVPF 125 103\r\n\
+                   a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+                   a=fmtp:103 apt=125\r\n\
+                   a=fmtp:111 minptime=10;useinbandfec=1\r\n";
+        let out = announce_start_bitrate(sdp, 3000);
+        assert!(out.contains("profile-level-id=42e01f;x-google-start-bitrate=3000\r\n"));
+        assert!(out.contains("a=fmtp:103 apt=125\r\n"), "RTX inchangé");
+        assert!(out.contains("a=fmtp:111 minptime=10;useinbandfec=1\r\n"), "Opus inchangé");
+        assert_eq!(announce_start_bitrate(sdp, 0), sdp);
+        assert_eq!(announce_start_bitrate(&out, 3000), out, "idempotent");
+    }
 
     /// Gestionnaire vide (les callbacks par défaut suffisent au test).
     struct NoopHandler;

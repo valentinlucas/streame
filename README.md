@@ -104,6 +104,7 @@ Voir `streame.example.toml` pour un exemple complet. Principales sections :
 bind = "0.0.0.0:8443"
 video_codec = "H264"          # ou "VP8"
 h264_profile_level_id = "42e01f"   # "640c1f" = profil High (meilleure qualité sur iPhone récent)
+video_start_bitrate_kbps = 3000    # débit de départ annoncé au téléphone (0 = 300 kb/s de libwebrtc)
 
 [video]
 width = 1920                  # taille du canevas des scènes (la sortie suit l'écran)
@@ -240,9 +241,15 @@ disponibles dans `GET /api/state`.
   + `create_texture_from_hal`) sans copie, en gardant le tampon vivant tant que la texture
   l'utilise. Sur une perte non rattrapée par NACK ou une erreur du décodeur, on demande une
   image-clé (PLI) et on jette tout jusqu'à l'IDR — bref gel plutôt qu'image pixellisée.
-- **Images-clés** : rafale au démarrage, puis à la demande (discontinuité, plus d'images) et un
-  filet de sécurité lent (`keyframe_interval_s`, 10 s par défaut, 0 = off). Pas d'image-clé
-  rapprochée : chacune est lourde et fait osciller la qualité.
+- **Images-clés** : une demande au démarrage, répétée toutes les 500 ms tant que rien n'est
+  décodé, puis à la demande (perte non rattrapée, erreur du décodeur, plus d'images) et un filet
+  de sécurité lent (`keyframe_interval_s`, 10 s par défaut, 0 = off). Pas de rafale ni d'image-clé
+  rapprochée : chacune coûte une image 1080p entière au téléphone, fait osciller la qualité et,
+  au démarrage, engorge son pacer alors que son estimation de débit part de 300 kb/s.
+- **Montée en débit** : libwebrtc part de 300 kb/s et monte de ~8 % par seconde, soit ~30 s pour
+  atteindre 8 Mb/s avec une cadence dégradée entre-temps. `video_start_bitrate_kbps` (3000 par
+  défaut) est annoncé dans l'offre (`x-google-start-bitrate`, lu par Chrome et Safari) pour
+  démarrer bien plus haut. Le plafond reste fixé par la page (`maxBitrate`, 8 Mb/s en 1080p).
 - **Lip-sync** : `video.av_offset_ms` (80 ms par défaut) retarde l'affichage de la vidéo pour
   l'aligner sur l'audio, dont la lecture est tamponnée (~70 ms + une trame). 0 = au plus tôt.
   L'alignement est « par construction » (budgets de tampon égalisés), pas par RTCP : à régler à
