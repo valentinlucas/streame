@@ -1,14 +1,22 @@
 //! Session WebRTC avec le téléphone, via **webrtc-rs** (crate `webrtc` + cœur sans-I/O `rtc`).
 //!
 //! Le Mac est l'« offreur » : il propose un flux audio bidirectionnel (retour vers le
-//! téléphone) et une réception vidéo. webrtc-rs gère ICE/DTLS/SRTP/RTP, le jitter buffer et le
-//! contrôle de congestion (TWCC/NACK) ; les codecs sont natifs, sans GStreamer :
+//! téléphone) et une réception vidéo. webrtc-rs gère ICE/DTLS/SRTP/RTP et le contrôle de
+//! congestion (TWCC/NACK) ; les codecs sont natifs, sans GStreamer :
 //!
 //! ```text
-//!  Téléphone ──RTP──► webrtc-rs (jitter buffer) ──► H264 dépaquetisé ─► VideoToolbox ─► IOSurface ─► GPU
-//!                                                └► Opus ─► libopus ─► anneau cpal ─► carte (Wing)
+//!  Téléphone ──RTP──► webrtc-rs ──► thread h264-decode (réassemblage) ─► VideoToolbox ─► IOSurface ─► GPU
+//!                              └► Opus ─► libopus ─► anneau cpal ─► carte (Wing)
 //!  carte (Wing) ─► cpal ─► libopus ─► TrackLocalStaticSample ─► webrtc-rs ─► RTP ─► Téléphone
 //! ```
+//!
+//! **Pas de jitter buffer paquet** (`Slot::JitterBuffer`) : comme dans libwebrtc, la remise en
+//! ordre vidéo est faite par l'assembleur d'images (`SampleBuilder`, fenêtre de 200 ms qui couvre
+//! une retransmission NACK) et la présentation par `video.av_offset_ms`. Le jitter buffer de
+//! webrtc-rs donnait à tous les paquets d'une même image la même échéance et libérait donc une
+//! image-clé de plusieurs centaines de paquets d'un seul bloc, ce qui débordait le canal borné
+//! (256 paquets) entre le pilote et la piste : paquets jetés, image cassée, PLI, nouvelle
+//! image-clé cassée… et le téléphone finissait bridé à quelques images par seconde.
 //!
 //! Le contrat vis-à-vis de `server.rs` (`ClientMsg`/`ServerMsg`, `start`/`set_answer`/`add_ice`/
 //! `close`) est conservé ; `start`/`set_answer`/`add_ice` sont `async` (le signaling tourne déjà
@@ -26,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use rtc::ice::mdns::MulticastDnsMode;
-use rtc::interceptor::{JitterBufferBuilder, Registry, Slot};
+use rtc::interceptor::Registry;
 use rtc::media::io::sample_builder::SampleBuilder;
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
@@ -373,18 +381,14 @@ impl PhoneSession {
         let runtime = runtime();
         let cancel = CancellationToken::new();
 
-        // --- Media engine + interceptors (NACK + TWCC + rapports) + jitter buffer -------------
+        // --- Media engine + interceptors (NACK + TWCC + rapports) ----------------------------
+        // Pas de `Slot::JitterBuffer` : voir l'en-tête du module.
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
             .context("register_default_codecs")?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)
             .context("interceptors par défaut")?;
-        let depth = Duration::from_millis(cfg.server.rtc_latency_ms.max(1) as u64);
-        let registry = registry.with(
-            Slot::JitterBuffer,
-            JitterBufferBuilder::new().with_depth(depth).build(),
-        );
 
         let mut ice_servers = vec![];
         let stun = cfg.server.stun_server.trim();
@@ -645,8 +649,9 @@ async fn resolve_payload_type(
 }
 
 /// Décode l'audio Opus entrant du téléphone avec libopus et le pousse dans le mixeur
-/// cpal (F32 stéréo 48 kHz). Les paquets sortent déjà ordonnés du jitter buffer webrtc-rs ;
-/// un paquet RTP Opus = une trame Opus (RFC 7587), donc pas de réassemblage.
+/// cpal (F32 stéréo 48 kHz). Un paquet RTP Opus = une trame Opus (RFC 7587), donc pas de
+/// réassemblage. Sans jitter buffer paquet, un paquet arrivé dans le désordre (rare sur un LAN)
+/// est ignoré : sa trame a déjà été dissimulée par le PLC.
 fn spawn_opus_decode(track: Arc<dyn TrackRemote>, engine: Arc<Engine>, cancel: CancellationToken) {
     tokio::spawn(async move {
         let mut dec = match opus::Decoder::new(48000, opus::Channels::Stereo) {
@@ -678,7 +683,7 @@ fn spawn_opus_decode(track: Arc<dyn TrackRemote>, engine: Arc<Engine>, cancel: C
                     if let Some(prev) = last_seq {
                         let delta = seq.wrapping_sub(prev) as i16;
                         if delta <= 0 {
-                            continue; // doublon ou paquet en retard déjà dissimulé
+                            continue; // doublon ou paquet dans le désordre, déjà dissimulé
                         }
                         let lost = (delta - 1) as usize;
                         if (1..=3).contains(&lost) {
@@ -787,10 +792,16 @@ fn spawn_opus_return(
     });
 }
 
-/// Vidéo H264 du téléphone en natif, sans GStreamer. Les paquets RTP (déjà ordonnés par
-/// le jitter buffer) sont réassemblés en unités d'accès par le `SampleBuilder` de webrtc-rs,
-/// décodés en matériel par VideoToolbox (`vt.rs`) et livrés au rendu en IOSurface (zéro copie).
-/// Une tâche de présentation applique le retard de lip-sync (`av_offset_ms`).
+/// Vidéo H264 du téléphone en natif, sans GStreamer. Les paquets RTP sont remis en ordre et
+/// réassemblés en unités d'accès par le `SampleBuilder` de webrtc-rs, décodés en matériel par
+/// VideoToolbox (`vt.rs`) et livrés au rendu en IOSurface (zéro copie). Une tâche de
+/// présentation applique le retard de lip-sync (`av_offset_ms`).
+///
+/// Le pilote webrtc-rs livre les paquets à la piste par un canal **borné** (256 paquets,
+/// constante du crate) et jette ce qui ne rentre pas (« Failed to send RtpPacket to track
+/// remote »). La tâche Tokio ne fait donc que vider ce canal vers une file sans limite ; le
+/// réassemblage et la soumission à VideoToolbox tournent sur un thread dédié `h264-decode`,
+/// hors des workers du runtime.
 fn spawn_native_h264(
     track: Arc<dyn TrackRemote>,
     engine: Arc<Engine>,
@@ -818,12 +829,82 @@ fn spawn_native_h264(
             }
         });
     }
+    let (pkt_tx, pkt_rx) = std::sync::mpsc::channel::<rtc::rtp::Packet>();
+    {
+        let cancel = cancel.clone();
+        let spawned = std::thread::Builder::new()
+            .name("h264-decode".into())
+            .spawn(move || {
+                let mut decoder = crate::vt::H264Decoder::new(tx);
+                // `max_late` se compte en PAQUETS non consommés : il doit dépasser la taille de la
+                // plus grosse image (une image-clé 1080p à haut débit fait plusieurs centaines de
+                // paquets). Avec 64, toute image-clé de plus de ~75 Ko était tronquée → décodeur
+                // en erreur → PLI → nouvelle image-clé tronquée… et le téléphone se bridait
+                // (débit et cadence). La latence reste bornée par `with_max_time_delay`
+                // (fenêtre de remise en ordre, suffisante pour une retransmission NACK).
+                let mut builder = SampleBuilder::new(2048, H264Packet::default(), clock_rate.max(1))
+                    .with_max_time_delay(Duration::from_millis(200));
+                let mut packets: u64 = 0;
+                let mut started = false;
+                let mut waiting_idr = false;
+                while let Ok(pkt) = pkt_rx.recv() {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    packets += 1;
+                    if packets == 1 {
+                        info!(
+                            "piste video : 1er paquet RTP (pt={}), décodage VideoToolbox natif",
+                            pkt.header.payload_type
+                        );
+                    }
+                    let now = Instant::now();
+                    builder.push(now, pkt);
+                    while let Some(sample) = builder.pop(now) {
+                        // `prev_dropped_packets` inclut les paquets de BOURRAGE (vides, envoyés par
+                        // libwebrtc pour sonder le débit, surtout juste après une image-clé),
+                        // comptés à part dans `prev_padding_packets` : seul le reste est une perte.
+                        let lost = sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets);
+                        if lost > 0 {
+                            warn!(
+                                "vidéo : {lost} paquet(s) perdu(s) avant l'image (non rattrapés par NACK)"
+                            );
+                            decoder.mark_loss();
+                            keyframe_needed.store(true, Ordering::Relaxed);
+                        }
+                        match decoder.decode(&sample.data, sample.packet_timestamp) {
+                            crate::vt::Outcome::Ok => {
+                                if !started {
+                                    started = true;
+                                    info!("vidéo : décodage VideoToolbox (matériel, IOSurface) démarré");
+                                }
+                                waiting_idr = false;
+                            }
+                            crate::vt::Outcome::NeedKeyframe => {
+                                if !waiting_idr {
+                                    waiting_idr = true;
+                                    debug!("VideoToolbox : en attente d'une image-clé (IDR)");
+                                }
+                                keyframe_needed.store(true, Ordering::Relaxed);
+                            }
+                            crate::vt::Outcome::Error(e) => {
+                                warn!("VideoToolbox : {e}");
+                                keyframe_needed.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    if packets % 250 == 0 {
+                        debug!("piste video : {packets} paquets RTP, {} images soumises", decoder.frames_submitted());
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            error!("thread h264-decode : {e}");
+            return;
+        }
+    }
+    // Tâche Tokio : simple transfert, pour que le canal borné du pilote soit vidé au plus vite.
     tokio::spawn(async move {
-        let mut decoder = crate::vt::H264Decoder::new(tx);
-        let mut builder = SampleBuilder::new(64, H264Packet::default(), clock_rate.max(1))
-            .with_max_time_delay(Duration::from_millis(200));
-        let mut packets: u64 = 0;
-        let mut started = false;
         loop {
             let evt = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -835,38 +916,8 @@ fn spawn_native_h264(
             };
             match evt {
                 TrackRemoteEvent::OnRtpPacket(pkt) => {
-                    packets += 1;
-                    if packets == 1 {
-                        info!(
-                            "piste video : 1er paquet RTP (pt={}), décodage VideoToolbox natif",
-                            pkt.header.payload_type
-                        );
-                    }
-                    let now = Instant::now();
-                    builder.push(now, pkt);
-                    while let Some(sample) = builder.pop(now) {
-                        if sample.prev_dropped_packets > 0 {
-                            decoder.mark_loss();
-                            keyframe_needed.store(true, Ordering::Relaxed);
-                        }
-                        match decoder.decode(&sample.data, sample.packet_timestamp) {
-                            crate::vt::Outcome::Ok => {
-                                if !started {
-                                    started = true;
-                                    info!("vidéo : décodage VideoToolbox (matériel, IOSurface) démarré");
-                                }
-                            }
-                            crate::vt::Outcome::NeedKeyframe => {
-                                keyframe_needed.store(true, Ordering::Relaxed);
-                            }
-                            crate::vt::Outcome::Error(e) => {
-                                warn!("VideoToolbox : {e}");
-                                keyframe_needed.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    if packets % 250 == 0 {
-                        debug!("piste video : {packets} paquets RTP, {} images soumises", decoder.frames_submitted());
+                    if pkt_tx.send(pkt).is_err() {
+                        break;
                     }
                 }
                 TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => break,
@@ -941,7 +992,7 @@ mod tests {
     impl PeerConnectionEventHandler for NoopHandler {}
 
     /// Vérifie le chemin webrtc-rs de bout en bout côté offreur : runtime, media engine,
-    /// interceptors + jitter buffer, ajout des pistes et génération d'une offre SDP valide.
+    /// interceptors, ajout des pistes et génération d'une offre SDP valide.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offer_generation_smoke() {
         let runtime = runtime();
@@ -949,12 +1000,6 @@ mod tests {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
         let registry = register_default_interceptors(Registry::new(), &mut media_engine).unwrap();
-        let registry = registry.with(
-            Slot::JitterBuffer,
-            JitterBufferBuilder::new()
-                .with_depth(Duration::from_millis(60))
-                .build(),
-        );
         let config = RTCConfigurationBuilder::new().with_ice_servers(vec![]).build();
         let setting_engine = SettingEngineBuilder::new()
             .with_multicast_dns_mode(MulticastDnsMode::QueryOnly)

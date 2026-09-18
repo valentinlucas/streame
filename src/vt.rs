@@ -53,6 +53,8 @@ pub enum Outcome {
 struct Sink {
     tx: mpsc::UnboundedSender<Decoded>,
     errors: AtomicU32,
+    /// Images sautées par le décodeur (statut OK sans image) : simple compteur.
+    dropped: AtomicU32,
 }
 
 pub struct H264Decoder {
@@ -81,14 +83,17 @@ unsafe extern "C-unwind" fn on_frame(
     // SAFETY: `refcon` pointe sur le `Sink` détenu par le décodeur, qui invalide la session
     // (plus aucun callback) avant de le libérer.
     let sink = unsafe { &*(refcon as *const Sink) };
-    let Some(image) = NonNull::new(image) else {
-        sink.errors.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
     if status != 0 {
         sink.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    let Some(image) = NonNull::new(image) else {
+        // Statut OK sans image : le décodeur a sauté l'image (kVTDecodeInfo_FrameDropped). Ce
+        // n'est pas une erreur de flux ; si une référence manque ensuite, la suivante échouera
+        // avec un statut, et c'est elle qui déclenchera la demande d'image-clé.
+        sink.dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     // SAFETY: le pointeur est un CVPixelBuffer valide pour la durée du callback ; on le retient.
     let pixel_buffer: CFRetained<CVPixelBuffer> = unsafe { CFRetained::retain(image) };
     match SurfaceFrame::from_pixel_buffer(pixel_buffer) {
@@ -192,6 +197,7 @@ impl H264Decoder {
             sink: Arc::new(Sink {
                 tx,
                 errors: AtomicU32::new(0),
+                dropped: AtomicU32::new(0),
             }),
             frames_in: 0,
         }
@@ -243,6 +249,10 @@ impl H264Decoder {
         self.session = Some(unsafe { CFRetained::from_raw(ptr) });
         self.format = Some(format);
         self.need_idr = true;
+        // Les images encore en vol dans l'ancienne session se terminent en erreur pendant
+        // `destroy_session` : sans rapport avec la nouvelle, dont on exige de toute façon un IDR.
+        self.sink.errors.store(0, Ordering::Relaxed);
+        tracing::debug!("VideoToolbox : session (re)créée (SPS/PPS)");
         Ok(())
     }
 
@@ -320,8 +330,10 @@ impl H264Decoder {
 
     /// Traite une unité d'accès Annex-B complète (horodatage RTP à 90 kHz).
     pub fn decode(&mut self, annexb: &[u8], rtp_ts: u32) -> Outcome {
-        if self.sink.errors.swap(0, Ordering::Relaxed) > 0 {
+        let errors = self.sink.errors.swap(0, Ordering::Relaxed);
+        if errors > 0 {
             // Une image précédente a échoué au décodage : on repart d'une image-clé.
+            tracing::debug!("VideoToolbox : {errors} image(s) en erreur, image-clé requise");
             self.need_idr = true;
         }
         let mut avcc = Vec::with_capacity(annexb.len() + 32);

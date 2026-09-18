@@ -104,7 +104,6 @@ Voir `streame.example.toml` pour un exemple complet. Principales sections :
 bind = "0.0.0.0:8443"
 video_codec = "H264"          # ou "VP8"
 h264_profile_level_id = "42e01f"   # "640c1f" = profil High (meilleure qualité sur iPhone récent)
-rtc_latency_ms = 60           # jitter buffer WebRTC (baisser sur LAN propre = moins de latence)
 
 [video]
 width = 1920                  # taille du canevas des scènes (la sortie suit l'écran)
@@ -175,7 +174,7 @@ Les fichiers vidéo sont lus par AVFoundation (tout format QuickTime/MP4 lisible
 | `src/avf.rs` | Lecture des fichiers d'habillage par **AVFoundation** (`AVAssetReader`, décodage matériel) : images NV12 sur IOSurface cadencées sur l'horloge murale, son PCM F32 48 kHz vers le bus d'habillage, boucle à temps continu. |
 | `src/render.rs` | Rendu wgpu : import zéro copie des IOSurfaces (texture Metal par plan → `create_texture_from_hal`), chaque scène dans une texture hors écran, fondu programme, tuiles/cadres/libellés du multiview, conversion NV12 → RGB dans le shader. |
 | `src/frame.rs` | Emplacements d'images partagés entre les décodeurs et le rendu : `SurfaceFrame` (CVPixelBuffer + IOSurface, gardé en vie tant qu'une texture l'utilise), dernière image + compteur i/s. |
-| `src/webrtc.rs` | Une session **webrtc-rs** par téléphone (le Mac fait l'offre, H264 seul) : ICE/DTLS/SRTP/RTP, jitter buffer et TWCC/NACK en Rust. Vidéo : RTP → dépaquetisation H264 (`SampleBuilder`) → `vt.rs` → IOSurface → GPU. Audio : décodage Opus par **libopus** (PLC/FEC) → mixeur cpal ; retour encodé par libopus au rythme de la carte, écrit sur la piste locale. Image-clé demandée par rafale au démarrage puis à la demande (perte, erreur, famine, filet périodique). |
+| `src/webrtc.rs` | Une session **webrtc-rs** par téléphone (le Mac fait l'offre, H264 seul) : ICE/DTLS/SRTP/RTP et TWCC/NACK en Rust. Vidéo : RTP → thread `h264-decode` (remise en ordre + dépaquetisation H264 par `SampleBuilder`) → `vt.rs` → IOSurface → GPU. Audio : décodage Opus par **libopus** (PLC/FEC) → mixeur cpal ; retour encodé par libopus au rythme de la carte, écrit sur la piste locale. Image-clé demandée par rafale au démarrage puis à la demande (perte, erreur, famine, filet périodique). |
 | `src/server.rs` | Serveur HTTPS axum : page téléphone, WebSocket de signaling, page/WebSocket de contrôle, API REST (avec statistiques). |
 | `src/ui.rs` | Fenêtres winit : programme (plein écran sur l'écran choisi) et multiview (clics, clavier), rendu cadencé sur la fréquence de l'écran. |
 | `src/streamdeck.rs` | Thread Stream Deck (hidapi) : rendu des touches, actions, reconnexion. |
@@ -221,8 +220,7 @@ disponibles dans `GET /api/state`.
 - **Transport WebRTC via webrtc-rs** (v0.21) : `register_default_interceptors` active NACK, les
   rapports RTCP et le *transport-wide-cc* (TWCC) — l'extension d'en-tête RTP est déclarée
   automatiquement. Sans TWCC, l'estimation de bande passante du téléphone reste bloquée au débit
-  plancher (~300 kb/s) et l'image est très dégradée malgré un réseau rapide. Le jitter buffer
-  adaptatif de webrtc-rs lisse le flux entrant (profondeur = `rtc_latency_ms`) avant le décodage.
+  plancher (~300 kb/s) et l'image est très dégradée malgré un réseau rapide.
   Le débit maximal est fixé côté téléphone (`web/app.js`) selon la résolution (8 Mb/s en 1080p).
   Le mode mDNS *QueryOnly* résout les candidats `.local` d'iOS/Safari pour l'ICE sur le LAN.
 - **Ordre des codecs** : webrtc-rs offre VP8 en premier par défaut, et les navigateurs suivent
@@ -233,8 +231,10 @@ disponibles dans `GET /api/state`.
   suit la route système : choisir les AirPods comme micro les fait devenir la route ; sinon,
   Centre de contrôle. Le micro peut être changé pendant le direct (`replaceTrack`, sans
   renégociation).
-- **Décodage vidéo natif zéro copie** : les paquets RTP sortent du jitter buffer, le
-  `SampleBuilder` de webrtc-rs réassemble les unités d'accès H264 (Annex-B), `vt.rs` les soumet
+- **Décodage vidéo natif zéro copie** : sur un thread dédié `h264-decode`, le `SampleBuilder`
+  de webrtc-rs remet les paquets en ordre (fenêtre de 200 ms, qui couvre une retransmission NACK ;
+  `max_late` = 2048 paquets, car il se compte en paquets non consommés et doit dépasser la plus
+  grosse image-clé) et réassemble les unités d'accès H264 (Annex-B) ; `vt.rs` les soumet
   à une `VTDecompressionSession` (session recréée si SPS/PPS changent) qui rend des
   `CVPixelBuffer` NV12 sur IOSurface ; `render.rs` en fait des textures Metal (`texture_from_raw`
   + `create_texture_from_hal`) sans copie, en gardant le tampon vivant tant que la texture
@@ -247,10 +247,15 @@ disponibles dans `GET /api/state`.
   l'aligner sur l'audio, dont la lecture est tamponnée (~70 ms + une trame). 0 = au plus tôt.
   L'alignement est « par construction » (budgets de tampon égalisés), pas par RTCP : à régler à
   l'œil si besoin.
-- **Jitter buffer** : une seule profondeur (`rtc_latency_ms`, 60 ms) pour audio et vidéo —
-  webrtc-rs 0.21 n'en propose pas une par média ; elle doit couvrir l'aller-retour NACK. En
-  pratique la vidéo s'affiche dès la sortie du buffer et l'audio a en plus son propre tampon
-  adaptatif de lecture (compensation de dérive), donc les latences effectives diffèrent déjà.
+- **Pas de jitter buffer paquet** : comme libwebrtc, la remise en ordre vidéo est faite par
+  l'assembleur d'images et la présentation par `av_offset_ms` ; l'audio a son tampon adaptatif de
+  lecture (un paquet Opus arrivé dans le désordre est ignoré, sa trame ayant déjà été dissimulée
+  par le PLC). Le jitter buffer de webrtc-rs 0.21 donnait à tous les paquets d'une même image la
+  même échéance et libérait une image-clé de plusieurs centaines de paquets d'un bloc, ce qui
+  débordait le canal borné (256 paquets) entre son pilote et la piste : paquets jetés, image
+  cassée, PLI, nouvelle image-clé cassée… et le téléphone finissait bridé à quelques images par
+  seconde et ~0,5 Mb/s. Symptôme à surveiller sur `/control` : compteur PLI qui grimpe (attendu :
+  6 au démarrage puis 1 toutes les `keyframe_interval_s`).
 - **Mesure de latence verre à verre** : `multiview.clock = true` affiche l'horloge du Mac (UTC,
   ms) dans le bandeau du multiview ; la page `https://<mac>:8443/latency` affiche la même
   horloge calée sur le Mac. Filmer cette page avec le téléphone : l'écart entre l'heure dans
