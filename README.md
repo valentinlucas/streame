@@ -105,6 +105,7 @@ bind = "0.0.0.0:8443"
 video_codec = "H264"          # ou "VP8"
 h264_profile_level_id = "42e01f"   # "640c1f" = profil High (meilleure qualité sur iPhone récent)
 video_start_bitrate_kbps = 3000    # débit de départ annoncé au téléphone (0 = 300 kb/s de libwebrtc)
+video_max_bitrate_kbps = 8000      # plafond en 1080p (720p = 56 %, 480p = 25 %) ; libwebrtc seul : 2,5 Mb/s
 
 [video]
 width = 1920                  # taille du canevas des scènes (la sortie suit l'écran)
@@ -222,7 +223,9 @@ disponibles dans `GET /api/state`.
   rapports RTCP et le *transport-wide-cc* (TWCC) — l'extension d'en-tête RTP est déclarée
   automatiquement. Sans TWCC, l'estimation de bande passante du téléphone reste bloquée au débit
   plancher (~300 kb/s) et l'image est très dégradée malgré un réseau rapide.
-  Le débit maximal est fixé côté téléphone (`web/app.js`) selon la résolution (8 Mb/s en 1080p).
+  Le débit maximal (`video_max_bitrate_kbps`, 8 Mb/s en 1080p) est lu par la page sur
+  `/api/config` et appliqué via `setParameters` ; sans plafond explicite, libwebrtc se limite
+  à 2,5 Mb/s au-delà de 960×540.
   Le mode mDNS *QueryOnly* résout les candidats `.local` d'iOS/Safari pour l'ICE sur le LAN.
 - **Ordre des codecs** : webrtc-rs offre VP8 en premier par défaut, et les navigateurs suivent
   l'ordre de l'offre — un iPhone encodait alors en VP8 (logiciel), sans décodage matériel côté
@@ -249,7 +252,8 @@ disponibles dans `GET /api/state`.
 - **Montée en débit** : libwebrtc part de 300 kb/s et monte de ~8 % par seconde, soit ~30 s pour
   atteindre 8 Mb/s avec une cadence dégradée entre-temps. `video_start_bitrate_kbps` (3000 par
   défaut) est annoncé dans l'offre (`x-google-start-bitrate`, lu par Chrome et Safari) pour
-  démarrer bien plus haut. Le plafond reste fixé par la page (`maxBitrate`, 8 Mb/s en 1080p).
+  démarrer bien plus haut. Le plafond est `video_max_bitrate_kbps` (8 Mb/s en 1080p) : au-delà
+  le gain visuel est faible et chaque image-clé devient une rafale que le Wi-Fi encaisse mal.
 - **Lip-sync** : `video.av_offset_ms` (80 ms par défaut) retarde l'affichage de la vidéo pour
   l'aligner sur l'audio, dont la lecture est tamponnée (~70 ms + une trame). 0 = au plus tôt.
   L'alignement est « par construction » (budgets de tampon égalisés), pas par RTCP : à régler à

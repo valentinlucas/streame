@@ -9,6 +9,20 @@
   let live = false;
   let wantConnected = false;
   let micOn = true, spkOn = true;
+  // Réglages fournis par streame (`/api/config`) ; valeurs de repli si la requête échoue.
+  let serverCfg = { video_max_bitrate_kbps: 8000 };
+  async function loadServerConfig() {
+    try {
+      const r = await fetch('/api/config', { cache: 'no-store' });
+      if (r.ok) serverCfg = Object.assign(serverCfg, await r.json());
+    } catch (e) { console.warn('[streame] /api/config', e); }
+  }
+  // Plafond de débit selon la qualité choisie : la valeur configurée vaut pour 1080p, les autres
+  // résolutions en prennent une part proportionnelle au nombre de pixels.
+  function maxBitrateFor(q) {
+    const share = { 1080: 1, 720: 0.5625, 480: 0.25 }[q] || 0.5;
+    return Math.round(serverCfg.video_max_bitrate_kbps * share) * 1000;
+  }
 
   // ---- Contraintes de capture (vidéo figée en 16:9 paysage) -------------------------------
   function constraints() {
@@ -158,6 +172,7 @@
     $('remote').play().catch(() => {});
     requestFullscreen(); // geste utilisateur : plein écran sur Android/desktop
     keepAwake();
+    await loadServerConfig();
     connectWs();
   }
 
@@ -240,7 +255,7 @@
         const p = s.getParameters();
         if (p.encodings && p.encodings.length) {
           const q = parseInt($('quality').value, 10);
-          p.encodings[0].maxBitrate = { 1080: 8_000_000, 720: 4_500_000, 480: 2_000_000 }[q] || 4_000_000;
+          p.encodings[0].maxBitrate = maxBitrateFor(q);
           p.degradationPreference = 'maintain-resolution';
           await s.setParameters(p);
         }

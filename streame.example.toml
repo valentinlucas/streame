@@ -8,6 +8,7 @@ video_codec = "H264"
 h264_profile_level_id = "42e01f"
 return_audio_bitrate = 64000
 video_start_bitrate_kbps = 3000
+video_max_bitrate_kbps = 8000
 keyframe_interval_s = 10
 
 [video]

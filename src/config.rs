@@ -40,6 +40,12 @@ pub struct ServerConfig {
     /// démarre sinon à 300 kb/s et monte de ~8 % par seconde : ~30 s pour atteindre 8 Mb/s, avec
     /// une cadence dégradée pendant la montée. 0 = comportement par défaut du téléphone.
     pub video_start_bitrate_kbps: u32,
+    /// Plafond de débit vidéo du téléphone en 1080p (kb/s), transmis à la page (`/api/config`)
+    /// qui l'applique via `setParameters` (720p = 56 %, 480p = 25 % de cette valeur). Sans
+    /// plafond explicite, libwebrtc se limite à 2,5 Mb/s au-delà de 960×540. 8 Mb/s en 1080p30
+    /// H264 : au-delà, le gain visuel est faible et les images-clés deviennent des rafales que le
+    /// Wi-Fi encaisse mal.
+    pub video_max_bitrate_kbps: u32,
     /// Image-clé de sécurité demandée périodiquement au téléphone (s). Les images-clés sont
     /// normalement demandées à la demande (discontinuité détectée, plus d'images) ; ce filet
     /// lent borne toute corruption non détectée. 0 = désactivé.
@@ -56,6 +62,7 @@ impl Default for ServerConfig {
             h264_profile_level_id: "42e01f".into(),
             return_audio_bitrate: 64000,
             video_start_bitrate_kbps: 3000,
+            video_max_bitrate_kbps: 8000,
             keyframe_interval_s: 10,
         }
     }
