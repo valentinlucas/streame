@@ -3,12 +3,12 @@
 [server]
 bind = "0.0.0.0:8443"
 cert_dir = "certs"
-stun_server = "stun://stun.l.google.com:19302"
+stun_server = ""   # vide sur un réseau local ; ex. "stun:stun.l.google.com:19302" hors LAN
 video_codec = "H264"
 h264_profile_level_id = "42e01f"
 return_audio_bitrate = 64000
 video_start_bitrate_kbps = 3000
-video_max_bitrate_kbps = 8000
+video_max_bitrate_kbps = 4000
 keyframe_interval_s = 10
 
 [video]

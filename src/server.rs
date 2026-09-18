@@ -397,6 +397,8 @@ async fn api_config(State(state): State<Shared>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "video_max_bitrate_kbps": state.cfg.server.video_max_bitrate_kbps,
         "video_start_bitrate_kbps": state.cfg.server.video_start_bitrate_kbps,
+        // Forme RFC 7064 « stun:hôte:port » (l'ancienne forme « stun://… » est acceptée).
+        "stun_server": state.cfg.server.stun_server.trim().replacen("://", ":", 1),
     }))
 }
 

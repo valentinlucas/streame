@@ -102,6 +102,7 @@ Voir `streame.example.toml` pour un exemple complet. Principales sections :
 ```toml
 [server]
 bind = "0.0.0.0:8443"
+stun_server = ""              # vide sur un réseau local ; un STUN ne sert que hors LAN (et rarement sans TURN)
 video_codec = "H264"          # ou "VP8"
 h264_profile_level_id = "42e01f"   # "640c1f" = profil High (meilleure qualité sur iPhone récent)
 video_start_bitrate_kbps = 3000    # débit de départ annoncé au téléphone (0 = 300 kb/s de libwebrtc)

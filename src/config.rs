@@ -27,7 +27,11 @@ pub struct ServerConfig {
     pub bind: String,
     /// Répertoire où sont stockés/générés le certificat et la clé TLS.
     pub cert_dir: String,
-    /// Serveur STUN (optionnel, utile hors LAN). Vide = aucun.
+    /// Serveur STUN (`stun:hôte:port`). Vide = aucun, le bon choix sur un réseau local : les
+    /// candidats « host » suffisent, et interroger un STUN ne fait qu'ajouter des requêtes vers
+    /// l'extérieur et un délai (ou des erreurs si la régie n'a pas Internet). Il ne sert que si
+    /// le téléphone est sur un autre réseau, et il faut alors en général un TURN en plus.
+    /// Transmis aussi à la page (`/api/config`) pour la RTCPeerConnection du téléphone.
     pub stun_server: String,
     /// Codec vidéo négocié avec le téléphone : "H264" seulement (décodage matériel VideoToolbox).
     pub video_codec: String,
@@ -57,7 +61,7 @@ impl Default for ServerConfig {
         Self {
             bind: "0.0.0.0:8443".into(),
             cert_dir: "certs".into(),
-            stun_server: "stun://stun.l.google.com:19302".into(),
+            stun_server: String::new(),
             video_codec: "H264".into(),
             h264_profile_level_id: "42e01f".into(),
             return_audio_bitrate: 64000,

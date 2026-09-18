@@ -10,7 +10,7 @@
   let wantConnected = false;
   let micOn = true, spkOn = true;
   // Réglages fournis par streame (`/api/config`) ; valeurs de repli si la requête échoue.
-  let serverCfg = { video_max_bitrate_kbps: 8000 };
+  let serverCfg = { video_max_bitrate_kbps: 8000, stun_server: '' };
   async function loadServerConfig() {
     try {
       const r = await fetch('/api/config', { cache: 'no-store' });
@@ -226,7 +226,8 @@
       } catch (e) { console.warn('[streame] ré-offre impossible, reconnexion complète', e); }
     }
     if (pc) pc.close();
-    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    // Sur un réseau local, pas de STUN : les candidats « host » suffisent (voir streame.toml).
+    pc = new RTCPeerConnection({ iceServers: serverCfg.stun_server ? [{ urls: serverCfg.stun_server }] : [] });
     window.streamePc = pc; // pour le débogage
     pc.oniceconnectionstatechange = () => console.log('[streame] ICE :', pc.iceConnectionState);
     pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'ice', candidate: e.candidate.candidate, sdpMLineIndex: e.candidate.sdpMLineIndex }); };
