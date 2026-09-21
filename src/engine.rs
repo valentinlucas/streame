@@ -66,17 +66,8 @@ pub struct RtpStats {
 }
 
 /// Statistiques envoyées par la page du téléphone (encodeur et réseau vus de son côté).
-#[derive(Debug, Clone, Serialize, serde::Deserialize, Default)]
-#[serde(default)]
-pub struct PhoneStats {
-    pub width: u32,
-    pub height: u32,
-    pub fps: f32,
-    pub bitrate_kbps: f32,
-    pub quality_limitation: String,
-    pub rtt_ms: Option<f32>,
-    pub codec: String,
-}
+/// Statistiques locales du téléphone (partagées avec l'app iOS).
+pub use streame_rtc::signaling::PhoneStats;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Stats {

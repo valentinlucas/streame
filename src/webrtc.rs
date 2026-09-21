@@ -25,95 +25,33 @@
 use crate::config::Config;
 use crate::engine::{Engine, PhoneStats, RtpStats};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use rtc::ice::mdns::MulticastDnsMode;
-use rtc::interceptor::Registry;
 use rtc::media::io::sample_builder::SampleBuilder;
-use rtc::media::Sample;
-use rtc::media_stream::MediaStreamTrack;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS};
 use rtc::peer_connection::configuration::RTCOfferOptions;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::codec::h264::H264Packet;
-use rtc::rtp_transceiver::rtp_sender::{
-    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
-    RTCRtpEncodingParameters, RtpCodecKind,
-};
+use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 use rtc::statistics::StatsSelector;
-use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
-    register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
-    PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer,
-    RTCIceConnectionState, RTCPeerConnectionIceErrorEvent, RTCPeerConnectionIceEvent,
-    RTCPeerConnectionState, RTCSessionDescription, RTCSignalingState, SettingEngineBuilder,
+    PeerConnection, PeerConnectionEventHandler, RTCIceCandidateInit, RTCIceConnectionState,
+    RTCPeerConnectionIceErrorEvent, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
+    RTCSessionDescription, RTCSignalingState,
 };
-use webrtc::rtp_transceiver::RtpSender;
-use webrtc::runtime::{default_runtime, Runtime};
 
-/// Messages téléphone → serveur.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMsg {
-    Hello {
-        #[serde(default)]
-        name: Option<String>,
-    },
-    Answer {
-        sdp: String,
-    },
-    Ice {
-        candidate: String,
-        #[serde(rename = "sdpMLineIndex")]
-        sdp_m_line_index: u32,
-    },
-    /// Statistiques locales de la page (encodeur, réseau).
-    Stats(PhoneStats),
-    Bye,
-}
-
-/// Messages serveur → téléphone.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMsg {
-    Offer {
-        sdp: String,
-    },
-    Ice {
-        candidate: String,
-        #[serde(rename = "sdpMLineIndex")]
-        sdp_m_line_index: u32,
-    },
-    Bye {
-        reason: String,
-    },
-    Error {
-        message: String,
-    },
-    /// Le flux du téléphone est-il diffusé sur la sortie programme du Mac.
-    OnAir {
-        on: bool,
-    },
-}
-
-/// Runtime webrtc-rs partagé (adossé à Tokio via la feature `runtime-tokio`).
-///
-/// `default_runtime()` construit un handle à chaque appel ; on le résout une seule fois pour
-/// tout le process, comme le recommande la doc de webrtc-rs.
-fn runtime() -> Arc<dyn Runtime> {
-    static RT: OnceLock<Arc<dyn Runtime>> = OnceLock::new();
-    RT.get_or_init(|| default_runtime().expect("runtime webrtc-rs (feature runtime-tokio)"))
-        .clone()
-}
+// Code partagé avec l'app iOS (crates/streame-rtc) : protocole, PeerConnection, Opus, H264.
+pub use streame_rtc::signaling::{ClientMsg, ServerMsg};
+use streame_rtc::h264::{announce_start_bitrate, video_codec_preferences};
+use streame_rtc::{opus, pc};
 
 pub struct PhoneSession {
     pub name: String,
@@ -219,7 +157,13 @@ impl PeerConnectionEventHandler for Handler {
 
         // Audio : décodage Opus direct (libopus) → mixeur cpal.
         if kind == RtpCodecKind::Audio {
-            spawn_opus_decode(track, self.engine.clone(), self.cancel.clone());
+            let engine = self.engine.clone();
+            opus::spawn_decoder(
+                track,
+                Arc::new(move |pcm: &[f32]| engine.push_phone_audio_f32(pcm)),
+                "audio téléphone",
+                self.cancel.clone(),
+            );
             return;
         }
         // Vidéo : seul H264 est offert (décodage matériel VideoToolbox) ; toute autre piste est
@@ -391,40 +335,11 @@ impl PhoneSession {
         out: mpsc::UnboundedSender<ServerMsg>,
         engine: Arc<Engine>,
     ) -> Result<Arc<Self>> {
-        let runtime = runtime();
         let cancel = CancellationToken::new();
 
         // --- Media engine + interceptors (NACK + TWCC + rapports) ----------------------------
         // Pas de `Slot::JitterBuffer` : voir l'en-tête du module.
-        let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .context("register_default_codecs")?;
-        let registry = register_default_interceptors(Registry::new(), &mut media_engine)
-            .context("interceptors par défaut")?;
-
-        let mut ice_servers = vec![];
-        let stun = cfg.server.stun_server.trim();
-        if !stun.is_empty() {
-            // webrtc-rs attend la forme RFC 7064 « stun:hôte:port » (sans « // »), alors que la
-            // config utilise l'ancienne forme « stun://… » de webrtcbin : on normalise.
-            let url = stun.replacen("://", ":", 1);
-            ice_servers.push(RTCIceServer {
-                urls: vec![url],
-                ..Default::default()
-            });
-        }
-        let config = RTCConfigurationBuilder::new()
-            .with_ice_servers(ice_servers)
-            .build();
-
-        // iOS/Safari masque ses candidats d'hôte derrière des noms mDNS `.local` : sans
-        // résolution mDNS, l'ICE sur le LAN échoue. `QueryOnly` résout ceux du téléphone sans
-        // annoncer les nôtres.
-        let setting_engine = SettingEngineBuilder::new()
-            .with_multicast_dns_mode(MulticastDnsMode::QueryOnly)
-            .with_multicast_dns_timeout(Some(Duration::from_secs(5)))
-            .build();
+        let (media_engine, registry) = pc::media_engine_and_registry(|r, _| Ok(r))?;
 
         // --- Gestionnaire d'événements --------------------------------------------------------
         let video_codec = Arc::new(StdMutex::new(cfg.server.video_codec.to_uppercase()));
@@ -444,50 +359,22 @@ impl PhoneSession {
         });
 
         // --- PeerConnection -------------------------------------------------------------------
-        // `0.0.0.0:0` : une socket par interface → candidats d'hôte exploitables sur le LAN.
-        let pc = PeerConnectionBuilder::new()
-            .with_configuration(config)
-            .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
-            .with_setting_engine(setting_engine)
-            .with_handler(handler as Arc<dyn PeerConnectionEventHandler>)
-            .with_runtime(runtime.clone())
-            .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
-            .build()
-            .await
-            .context("construction de la PeerConnection")?;
-        let pc: Arc<dyn PeerConnection> = Arc::new(pc);
+        // iOS/Safari masque ses candidats d'hôte derrière des noms mDNS `.local` : sans
+        // résolution mDNS, l'ICE sur le LAN échoue. `QueryOnly` résout ceux du téléphone sans
+        // annoncer les nôtres.
+        let pc = pc::build_peer_connection(
+            pc::ice_servers(&cfg.server.stun_server),
+            media_engine,
+            registry,
+            MulticastDnsMode::QueryOnly,
+            vec!["0.0.0.0:0".to_string()],
+            handler as Arc<dyn PeerConnectionEventHandler>,
+        )
+        .await?;
         *pc_slot.lock().unwrap() = Some(pc.clone());
 
         // --- Audio retour : piste locale Opus (envoyée vers le téléphone) ---------------------
-        let ssrc = rand::random::<u32>();
-        let opus_codec = RTCRtpCodec {
-            mime_type: MIME_TYPE_OPUS.to_owned(),
-            clock_rate: 48000,
-            channels: 2,
-            sdp_fmtp_line: String::new(),
-            rtcp_feedback: vec![],
-        };
-        let return_track = Arc::new(
-            TrackLocalStaticSample::new(
-                Instant::now(),
-                MediaStreamTrack::new(
-                    "streame-return".to_string(),
-                    "return-audio".to_string(),
-                    "return".to_string(),
-                    RtpCodecKind::Audio,
-                    vec![RTCRtpEncodingParameters {
-                        rtp_coding_parameters: RTCRtpCodingParameters {
-                            ssrc: Some(ssrc),
-                            ..Default::default()
-                        },
-                        codec: opus_codec,
-                        ..Default::default()
-                    }],
-                ),
-            )
-            .context("piste locale de retour")?,
-        );
+        let (return_track, ssrc) = opus::new_local_track("streame-return", "return-audio", "return")?;
         // Audio en sendrecv (envoi du retour + réception du micro du téléphone).
         let sender = pc
             .add_track(return_track.clone() as Arc<dyn TrackLocal>)
@@ -512,14 +399,19 @@ impl PhoneSession {
             warn!("préférence de codec vidéo refusée ({e}) : ordre par défaut de webrtc-rs");
         }
 
-        // Son de retour → téléphone : encodage Opus (libopus) depuis l'entrée carte (cpal).
+        // Son de retour → téléphone : encodage Opus (libopus) depuis l'entrée carte (cpal),
+        // cadencé par la carte (même code que le micro de l'app iOS).
         match engine.return_reader() {
-            Some(reader) => spawn_opus_return(
-                reader,
+            Some(reader) => opus::spawn_encoder(
+                Arc::new(reader),
                 return_track,
                 sender,
                 ssrc,
-                cfg.server.return_audio_bitrate,
+                opus::EncoderOptions {
+                    bitrate: cfg.server.return_audio_bitrate,
+                    application: ::opus::Application::Voip,
+                    label: "retour audio",
+                },
                 cancel.clone(),
             ),
             None => warn!("retour : entrée audio non initialisée, pas de son renvoyé"),
@@ -599,240 +491,6 @@ impl Drop for PhoneSession {
     fn drop(&mut self) {
         self.close();
     }
-}
-
-/// Codecs vidéo offerts : **H264 uniquement**, en `packetization-mode=1` (celui des iPhone),
-/// le profil configuré en tête. Le décodage est matériel (VideoToolbox), qui ne gère ni VP8 ni
-/// VP9 : les proposer reviendrait à risquer une négociation sans image. Les paramètres (fmtp,
-/// types de charge utile) reprennent ceux enregistrés par `register_default_codecs`, sinon la
-/// préférence est refusée (et la ligne fmtp de l'offre est celle du codec enregistré, d'où
-/// l'ajout de `x-google-start-bitrate` par [`announce_start_bitrate`] sur le texte envoyé).
-fn video_codec_preferences(profile_level_id: &str) -> Vec<RTCRtpCodecParameters> {
-    let fb = || {
-        vec![
-            RTCPFeedback { typ: "goog-remb".into(), parameter: String::new() },
-            RTCPFeedback { typ: "ccm".into(), parameter: "fir".into() },
-            RTCPFeedback { typ: "nack".into(), parameter: String::new() },
-            RTCPFeedback { typ: "nack".into(), parameter: "pli".into() },
-            RTCPFeedback { typ: "transport-cc".into(), parameter: String::new() },
-        ]
-    };
-    let codec = |fmtp: &str, pt: u8| RTCRtpCodecParameters {
-        rtp_codec: RTCRtpCodec {
-            mime_type: MIME_TYPE_H264.to_owned(),
-            clock_rate: 90000,
-            channels: 0,
-            sdp_fmtp_line: fmtp.to_owned(),
-            rtcp_feedback: fb(),
-        },
-        payload_type: pt,
-    };
-    let mut out = vec![
-        codec("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", 125),
-        codec("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f", 102),
-        codec("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032", 123),
-    ];
-    let wanted = profile_level_id.trim().to_ascii_lowercase();
-    if let Some(i) = out
-        .iter()
-        .position(|c| c.rtp_codec.sdp_fmtp_line.contains(&format!("profile-level-id={wanted}")))
-    {
-        let first = out.remove(i);
-        out.insert(0, first);
-    }
-    out
-}
-
-/// Ajoute `x-google-start-bitrate=<kb/s>` aux lignes fmtp H264 de l'offre **envoyée au
-/// téléphone**. libwebrtc (Chrome, Safari) lit ce paramètre dans la description distante et
-/// démarre son encodeur à ce débit au lieu de 300 kb/s, ce qui évite ~30 s de montée à cadence
-/// dégradée. Seul le texte transmis est modifié : la description locale de webrtc-rs reste
-/// telle quelle (le paramètre ne concerne que l'encodeur distant) et la réponse du téléphone
-/// ne le reprend pas. `kbps` = 0 → texte inchangé.
-fn announce_start_bitrate(sdp: &str, kbps: u32) -> String {
-    if kbps == 0 {
-        return sdp.to_string();
-    }
-    let mut out = String::with_capacity(sdp.len() + 64);
-    for line in sdp.split_inclusive('\n') {
-        let body = line.trim_end_matches(['\r', '\n']);
-        if body.starts_with("a=fmtp:")
-            && body.contains("profile-level-id=")
-            && !body.contains("x-google-start-bitrate=")
-        {
-            out.push_str(body);
-            out.push_str(&format!(";x-google-start-bitrate={kbps}"));
-            out.push_str(&line[body.len()..]);
-        } else {
-            out.push_str(line);
-        }
-    }
-    out
-}
-
-/// Attend que le type de charge utile de l'émetteur soit négocié (après la réponse SDP).
-async fn resolve_payload_type(
-    sender: &Arc<dyn RtpSender>,
-    cancel: &CancellationToken,
-) -> Option<u8> {
-    loop {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        if let Ok(params) = sender.get_parameters().await {
-            if let Some(codec) = params.rtp_parameters.codecs.first() {
-                return Some(codec.payload_type);
-            }
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => return None,
-            _ = tokio::time::sleep(Duration::from_millis(150)) => {}
-        }
-    }
-}
-
-/// Décode l'audio Opus entrant du téléphone avec libopus et le pousse dans le mixeur
-/// cpal (F32 stéréo 48 kHz). Un paquet RTP Opus = une trame Opus (RFC 7587), donc pas de
-/// réassemblage. Sans jitter buffer paquet, un paquet arrivé dans le désordre (rare sur un LAN)
-/// est ignoré : sa trame a déjà été dissimulée par le PLC.
-fn spawn_opus_decode(track: Arc<dyn TrackRemote>, engine: Arc<Engine>, cancel: CancellationToken) {
-    tokio::spawn(async move {
-        let mut dec = match opus::Decoder::new(48000, opus::Channels::Stereo) {
-            Ok(d) => d,
-            Err(e) => {
-                error!("décodeur Opus : {e}");
-                return;
-            }
-        };
-        let mut pcm = vec![0f32; 5760 * 2]; // jusqu'à 120 ms stéréo @ 48 kHz
-        let mut started = false;
-        // Dissimulation des pertes : on suit les numéros de séquence ; sur un trou de 1 à 3
-        // paquets, les trames manquantes sont reconstituées par PLC (extrapolation libopus) et
-        // la dernière par le FEC en bande du paquet suivant quand le téléphone l'envoie
-        // (useinbandfec=1 négocié). Sans ça, chaque paquet perdu = un trou audible.
-        let mut last_seq: Option<u16> = None;
-        let mut last_per_ch: usize = 960; // taille de la dernière trame (20 ms par défaut)
-        let mut concealed: u64 = 0;
-        loop {
-            let evt = tokio::select! {
-                _ = cancel.cancelled() => break,
-                evt = track.poll() => evt,
-            };
-            let Some(evt) = evt else { break };
-            match evt {
-                TrackRemoteEvent::OnRtpPacket(pkt) => {
-                    let seq = pkt.header.sequence_number;
-                    let payload = pkt.payload.as_ref();
-                    if let Some(prev) = last_seq {
-                        let delta = seq.wrapping_sub(prev) as i16;
-                        if delta <= 0 {
-                            continue; // doublon ou paquet dans le désordre, déjà dissimulé
-                        }
-                        let lost = (delta - 1) as usize;
-                        if (1..=3).contains(&lost) {
-                            let fs = last_per_ch * 2;
-                            for _ in 1..lost {
-                                if let Ok(n) = dec.decode_float(&[], &mut pcm[..fs], false) {
-                                    engine.push_phone_audio_f32(&pcm[..n * 2]);
-                                }
-                            }
-                            if let Ok(n) = dec.decode_float(payload, &mut pcm[..fs], true) {
-                                engine.push_phone_audio_f32(&pcm[..n * 2]);
-                            }
-                            concealed += lost as u64;
-                            if concealed % 50 < lost as u64 {
-                                debug!("audio téléphone : {concealed} trames dissimulées (PLC/FEC)");
-                            }
-                        }
-                    }
-                    last_seq = Some(seq);
-                    match dec.decode_float(payload, &mut pcm, false) {
-                        Ok(per_ch) => {
-                            last_per_ch = per_ch.max(1);
-                            engine.push_phone_audio_f32(&pcm[..per_ch * 2]);
-                            if !started {
-                                info!("audio téléphone : décodage Opus (libopus) démarré");
-                                started = true;
-                            }
-                        }
-                        Err(e) => warn!("décodage Opus : {e}"),
-                    }
-                }
-                TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError => break,
-                _ => {}
-            }
-        }
-    });
-}
-
-/// Encode le retour de la carte (entrée cpal, F32 stéréo 48 kHz) en Opus avec libopus
-/// et l'écrit sur la piste locale webrtc-rs, sans GStreamer. Cadence 20 ms.
-fn spawn_opus_return(
-    reader: crate::audio::cpal_out::Reader,
-    track: Arc<TrackLocalStaticSample>,
-    sender: Arc<dyn RtpSender>,
-    ssrc: u32,
-    bitrate: i32,
-    cancel: CancellationToken,
-) {
-    tokio::spawn(async move {
-        let Some(pt) = resolve_payload_type(&sender, &cancel).await else {
-            return;
-        };
-        let mut enc =
-            match opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Voip) {
-                Ok(e) => e,
-                Err(e) => {
-                    error!("encodeur Opus : {e}");
-                    return;
-                }
-            };
-        let _ = enc.set_bitrate(opus::Bitrate::Bits(bitrate));
-        // FEC en bande : chaque paquet emporte une version basse qualité du précédent, le
-        // téléphone récupère ainsi un paquet perdu isolé sans attendre de retransmission.
-        let _ = enc.set_inband_fec(true);
-        let _ = enc.set_packet_loss_perc(10);
-        let _ = enc.set_dtx(false);
-        let frame = 960 * 2; // 20 ms stéréo @ 48 kHz
-        let mut pcm = vec![0f32; frame];
-        let mut out = vec![0u8; 4000];
-        info!("retour audio : encodage Opus (libopus) démarré, cadencé par la carte");
-        // Cadencé par la CARTE, pas par une horloge murale : on encode une trame dès que
-        // 20 ms ont été capturées. Une seule horloge sur ce chemin → aucune dérive à compenser,
-        // les timestamps RTP suivent exactement la capture ; le jitter buffer du téléphone
-        // absorbe le réseau. Latence ≈ 1 trame + ~3 ms de scrutation.
-        loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-            if !reader.pull_frame(&mut pcm) {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(3)) => {}
-                }
-                continue;
-            }
-            match enc.encode_float(&pcm, &mut out) {
-                Ok(len) if len > 0 => {
-                    let sample = Sample {
-                        data: bytes::Bytes::copy_from_slice(&out[..len]),
-                        duration: Duration::from_millis(20),
-                        ..Sample::new(Instant::now())
-                    };
-                    if track
-                        .sample_writer(ssrc, pt)
-                        .write_sample(&sample)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => warn!("encodage Opus retour : {e}"),
-            }
-        }
-    });
 }
 
 /// Vidéo H264 du téléphone en natif, sans GStreamer. Les paquets RTP sont remis en ordre et
@@ -1032,20 +690,6 @@ fn spawn_stats(
 mod tests {
     use super::*;
 
-    #[test]
-    fn debit_de_depart_annonce_sur_les_fmtp_h264() {
-        let sdp = "m=video 9 UDP/TLS/RTP/SAVPF 125 103\r\n\
-                   a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
-                   a=fmtp:103 apt=125\r\n\
-                   a=fmtp:111 minptime=10;useinbandfec=1\r\n";
-        let out = announce_start_bitrate(sdp, 3000);
-        assert!(out.contains("profile-level-id=42e01f;x-google-start-bitrate=3000\r\n"));
-        assert!(out.contains("a=fmtp:103 apt=125\r\n"), "RTX inchangé");
-        assert!(out.contains("a=fmtp:111 minptime=10;useinbandfec=1\r\n"), "Opus inchangé");
-        assert_eq!(announce_start_bitrate(sdp, 0), sdp);
-        assert_eq!(announce_start_bitrate(&out, 3000), out, "idempotent");
-    }
-
     /// Gestionnaire vide (les callbacks par défaut suffisent au test).
     struct NoopHandler;
     #[async_trait::async_trait]
@@ -1055,56 +699,19 @@ mod tests {
     /// interceptors, ajout des pistes et génération d'une offre SDP valide.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offer_generation_smoke() {
-        let runtime = runtime();
+        let (media_engine, registry) = pc::media_engine_and_registry(|r, _| Ok(r)).unwrap();
+        let pc = pc::build_peer_connection(
+            vec![],
+            media_engine,
+            registry,
+            MulticastDnsMode::QueryOnly,
+            vec!["0.0.0.0:0".to_string()],
+            Arc::new(NoopHandler) as Arc<dyn PeerConnectionEventHandler>,
+        )
+        .await
+        .expect("construction PeerConnection");
 
-        let mut media_engine = MediaEngine::default();
-        media_engine.register_default_codecs().unwrap();
-        let registry = register_default_interceptors(Registry::new(), &mut media_engine).unwrap();
-        let config = RTCConfigurationBuilder::new().with_ice_servers(vec![]).build();
-        let setting_engine = SettingEngineBuilder::new()
-            .with_multicast_dns_mode(MulticastDnsMode::QueryOnly)
-            .build();
-
-        let pc = PeerConnectionBuilder::new()
-            .with_configuration(config)
-            .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
-            .with_setting_engine(setting_engine)
-            .with_handler(Arc::new(NoopHandler) as Arc<dyn PeerConnectionEventHandler>)
-            .with_runtime(runtime)
-            .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
-            .build()
-            .await
-            .expect("construction PeerConnection");
-        let pc: Arc<dyn PeerConnection> = Arc::new(pc);
-
-        let opus = RTCRtpCodec {
-            mime_type: MIME_TYPE_OPUS.to_owned(),
-            clock_rate: 48000,
-            channels: 2,
-            sdp_fmtp_line: String::new(),
-            rtcp_feedback: vec![],
-        };
-        let track = Arc::new(
-            TrackLocalStaticSample::new(
-                Instant::now(),
-                MediaStreamTrack::new(
-                    "s".into(),
-                    "t".into(),
-                    "l".into(),
-                    RtpCodecKind::Audio,
-                    vec![RTCRtpEncodingParameters {
-                        rtp_coding_parameters: RTCRtpCodingParameters {
-                            ssrc: Some(rand::random::<u32>()),
-                            ..Default::default()
-                        },
-                        codec: opus,
-                        ..Default::default()
-                    }],
-                ),
-            )
-            .unwrap(),
-        );
+        let (track, _ssrc) = opus::new_local_track("s", "t", "l").unwrap();
         pc.add_track(track as Arc<dyn TrackLocal>).await.unwrap();
         pc.add_transceiver_from_kind(
             RtpCodecKind::Video,

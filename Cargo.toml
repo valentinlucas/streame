@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/streame-rtc", "crates/streame-ios"]
+resolver = "2"
+
 [package]
 name = "streame"
 version = "0.1.0"
@@ -6,6 +10,9 @@ description = "Régie vidéo légère : caméra/son d'un téléphone en WebRTC �
 license = "MIT"
 
 [dependencies]
+# Code média partagé avec l'app iOS (signaling, PeerConnection, Opus, H264) : voir crates/streame-rtc.
+streame-rtc = { path = "crates/streame-rtc" }
+
 # WebRTC en Rust (crate async `webrtc` + cœur sans-I/O `rtc`) : ICE/DTLS/SRTP/RTP,
 # jitter buffer, TWCC/NACK. Remplace webrtcbin de GStreamer.
 webrtc = "=0.21.0-rc.2"
@@ -23,6 +30,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = "0.13"
 futures-util = "0.3"
 local-ip-address = "0.6"
+# Annonce Bonjour `_streame._tcp` (découverte de la régie par l'app iOS).
+mdns-sd = "0.21"
+hostname = "0.4"
 qrcode = { version = "0.14", default-features = false }
 
 # Fenêtres (sortie HDMI + multiview) et rendu GPU (Metal sur macOS via wgpu)

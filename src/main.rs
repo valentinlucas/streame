@@ -8,6 +8,7 @@
 mod audio;
 mod avf;
 mod config;
+mod discovery;
 mod engine;
 mod frame;
 mod layout;
@@ -122,6 +123,19 @@ fn main() -> Result<()> {
     let _deck = streamdeck::spawn(cfg.clone(), engine.clone());
     engine.start()?;
     print_urls(&cfg, &ips);
+    // Bonjour : l'app iOS découvre la régie sans saisir d'adresse.
+    let _mdns = if cfg.server.mdns {
+        let port = cfg.server.bind.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(8443);
+        match discovery::Advertiser::start(&cfg, &ips, port) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                warn!("annonce Bonjour impossible : {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Ctrl-C : arrêt propre (ferme les flux CoreAudio, sinon la carte USB peut rester coincée).
     {

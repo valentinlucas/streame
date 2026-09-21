@@ -1,0 +1,76 @@
+# Projet Xcode généré par XcodeGen : `brew install xcodegen && cd ios && xcodegen generate`.
+# La bibliothèque Rust (crates/streame-ios) est compilée par build-rust.sh avant chaque build.
+name: Streame
+options:
+  bundleIdPrefix: fr.lvlab
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CODE_SIGN_STYLE: Automatic
+    # Équipe de signature (Apple Development) : évite de la ressaisir dans Xcode après chaque
+    # `xcodegen generate`. À adapter si le projet change de compte.
+    DEVELOPMENT_TEAM: KQHCCH6436
+targets:
+  Streame:
+    type: application
+    platform: iOS
+    sources:
+      - path: Streame
+      - path: StreameCore/include
+        buildPhase: none
+    info:
+      path: Streame/Info.plist
+      properties:
+        CFBundleDisplayName: Streame
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIViewControllerBasedStatusBarAppearance: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationLandscapeLeft
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationLandscapeLeft
+        NSCameraUsageDescription: "La caméra est envoyée en direct à la régie Streame."
+        NSMicrophoneUsageDescription: "Le micro est envoyé en direct à la régie Streame."
+        NSLocalNetworkUsageDescription: "Streame cherche la régie (Mac) sur le réseau local et lui envoie la vidéo."
+        NSBonjourServices:
+          - _streame._tcp
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: fr.lvlab.streame
+        SWIFT_OBJC_BRIDGING_HEADER: Streame/Streame-Bridging-Header.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)/StreameCore/include
+        OTHER_LDFLAGS: -lstreame_ios
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": $(SRCROOT)/StreameCore/lib/ios
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": $(SRCROOT)/StreameCore/lib/ios-sim
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_BITCODE: false
+        # La bibliothèque Rust du simulateur est arm64 seulement (Mac Apple Silicon).
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+        # Pas de « Streame.debug.dylib » (Xcode 16+) : un seul exécutable à charger au lancement,
+        # les aperçus SwiftUI ne sont pas utilisés.
+        ENABLE_DEBUG_DYLIB: false
+    dependencies:
+      - sdk: AVFoundation.framework
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+      - sdk: Network.framework
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
+    preBuildScripts:
+      - name: Rust (libstreame_ios.a)
+        script: |
+          "$SRCROOT/build-rust.sh" "$PLATFORM_NAME" "$CONFIGURATION"
+        # Toujours exécuté : cargo décide lui-même s'il y a quelque chose à recompiler.
+        basedOnDependencyAnalysis: false

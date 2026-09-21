@@ -54,6 +54,10 @@ pub struct ServerConfig {
     /// normalement demandées à la demande (discontinuité détectée, plus d'images) ; ce filet
     /// lent borne toute corruption non détectée. 0 = désactivé.
     pub keyframe_interval_s: u32,
+    /// Annonce Bonjour `_streame._tcp` (découverte de la régie par l'app iOS).
+    pub mdns: bool,
+    /// Nom de la régie affiché par l'app iOS (vide = nom de la machine).
+    pub name: String,
 }
 
 impl Default for ServerConfig {
@@ -68,6 +72,8 @@ impl Default for ServerConfig {
             video_start_bitrate_kbps: 3000,
             video_max_bitrate_kbps: 8000,
             keyframe_interval_s: 10,
+            mdns: true,
+            name: String::new(),
         }
     }
 }

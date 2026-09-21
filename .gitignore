@@ -8,3 +8,9 @@
 /scripts/node_modules
 /scripts/package.json
 /scripts/package-lock.json
+
+# App iOS : bibliothèque Rust compilée pour l'iPhone et projet Xcode généré (xcodegen)
+/ios/StreameCore/lib
+/ios/Streame.xcodeproj
+/ios/Streame/Info.plist
+/ios/build

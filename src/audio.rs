@@ -730,3 +730,10 @@ pub mod cpal_out {
         ))
     }
 }
+
+/// Le lecteur du retour est la source PCM de l'encodeur Opus partagé (`streame-rtc`).
+impl streame_rtc::opus::PcmSource for cpal_out::Reader {
+    fn pull_frame(&self, out: &mut [f32]) -> bool {
+        cpal_out::Reader::pull_frame(self, out)
+    }
+}

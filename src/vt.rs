@@ -106,35 +106,7 @@ unsafe extern "C-unwind" fn on_frame(
     }
 }
 
-/// Découpe un flux Annex-B en NALUs (sans les codes de démarrage).
-fn nalus(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut start: Option<usize> = None;
-    while i + 2 < data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            if let Some(s) = start {
-                let mut end = i;
-                if end > s && data[end - 1] == 0 {
-                    end -= 1; // code à 4 octets (00 00 00 01)
-                }
-                if end > s {
-                    out.push(&data[s..end]);
-                }
-            }
-            i += 3;
-            start = Some(i);
-        } else {
-            i += 1;
-        }
-    }
-    if let Some(s) = start {
-        if s < data.len() {
-            out.push(&data[s..]);
-        }
-    }
-    out
-}
+use streame_rtc::h264::nalus;
 
 /// Attributs des tampons de sortie : NV12 (« 420v »), compatibles Metal, adossés à une IOSurface.
 fn destination_attributes() -> CFRetained<CFDictionary<CFString, CFType>> {
@@ -394,20 +366,5 @@ impl Drop for H264Decoder {
     fn drop(&mut self) {
         // Plus aucun callback après l'invalidation : le `Sink` peut alors être libéré.
         self.destroy_session();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::nalus;
-
-    #[test]
-    fn decoupe_annexb() {
-        let data = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 5, 6];
-        let n = nalus(&data);
-        assert_eq!(n.len(), 3);
-        assert_eq!(n[0], &[0x67, 1, 2]);
-        assert_eq!(n[1], &[0x68, 3]);
-        assert_eq!(n[2], &[0x65, 4, 5, 6]);
     }
 }

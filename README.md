@@ -24,6 +24,10 @@ téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôl
   (nom, objectif de caméra, source audio, qualité) avec aperçu, puis écran direct épuré à
   trois boutons (micro, son, quitter). Vidéo H264 + audio Opus en WebRTC, un seul
   téléphone à la fois (une nouvelle connexion remplace la précédente).
+- **App iOS native** (`ios/`) : même fonction que la page, mais avec **le même code Rust que
+  la régie** (crate `crates/streame-rtc` : webrtc-rs, libopus, VideoToolbox, cpal) — pas de
+  libwebrtc. Découverte de la régie en Bonjour (`_streame._tcp`), contrôle de congestion GCC,
+  images-clés à la demande. Voir `ios/README.md`.
 - **Objectif et source audio** : la liste des caméras (les objectifs de l'iPhone : grand angle,
   ultra grand angle, téléobjectif) et des entrées audio (micro intégré, AirPods…) est proposée
   après autorisation. La capture est figée en 16:9 paysage ; une invite demande de tourner le
@@ -107,6 +111,8 @@ video_codec = "H264"          # ou "VP8"
 h264_profile_level_id = "42e01f"   # "640c1f" = profil High (meilleure qualité sur iPhone récent)
 video_start_bitrate_kbps = 3000    # débit de départ annoncé au téléphone (0 = 300 kb/s de libwebrtc)
 video_max_bitrate_kbps = 8000      # plafond en 1080p (720p = 56 %, 480p = 25 %) ; libwebrtc seul : 2,5 Mb/s
+mdns = true                        # annonce Bonjour _streame._tcp pour l'app iOS
+name = ""                          # nom de la régie dans l'app (vide = nom du Mac)
 
 [video]
 width = 1920                  # taille du canevas des scènes (la sortie suit l'écran)
@@ -177,6 +183,9 @@ Les fichiers vidéo sont lus par AVFoundation (tout format QuickTime/MP4 lisible
 | `src/avf.rs` | Lecture des fichiers d'habillage par **AVFoundation** (`AVAssetReader`, décodage matériel) : images NV12 sur IOSurface cadencées sur l'horloge murale, son PCM F32 48 kHz vers le bus d'habillage, boucle à temps continu. |
 | `src/render.rs` | Rendu wgpu : import zéro copie des IOSurfaces (texture Metal par plan → `create_texture_from_hal`), chaque scène dans une texture hors écran, fondu programme, tuiles/cadres/libellés du multiview, conversion NV12 → RGB dans le shader. |
 | `src/frame.rs` | Emplacements d'images partagés entre les décodeurs et le rendu : `SurfaceFrame` (CVPixelBuffer + IOSurface, gardé en vie tant qu'une texture l'utilise), dernière image + compteur i/s. |
+| `crates/streame-rtc/` | **Code média partagé avec l'app iOS** : messages de signaling, construction de la `PeerConnection` webrtc-rs, piste/encodeur/décodeur Opus (libopus, cadencé par la source, PLC/FEC), paramètres H264 ; feature `client` = session téléphone complète (répondeur WebRTC + GCC, encodeur VideoToolbox, audio cpal, WebSocket TLS) et banc `examples/fake_phone.rs`. |
+| `crates/streame-ios/` | Bibliothèque statique (API C) de la session téléphone pour l'app iOS (`ios/`). |
+| `src/discovery.rs` | Annonce Bonjour `_streame._tcp` (mdns-sd) pour que l'app iOS trouve la régie. |
 | `src/webrtc.rs` | Une session **webrtc-rs** par téléphone (le Mac fait l'offre, H264 seul) : ICE/DTLS/SRTP/RTP et TWCC/NACK en Rust. Vidéo : RTP → thread `h264-decode` (remise en ordre + dépaquetisation H264 par `SampleBuilder`) → `vt.rs` → IOSurface → GPU. Audio : décodage Opus par **libopus** (PLC/FEC) → mixeur cpal ; retour encodé par libopus au rythme de la carte, écrit sur la piste locale. Image-clé demandée par rafale au démarrage puis à la demande (perte, erreur, famine, filet périodique). |
 | `src/server.rs` | Serveur HTTPS axum : page téléphone, WebSocket de signaling, page/WebSocket de contrôle, API REST (avec statistiques). |
 | `src/ui.rs` | Fenêtres winit : programme (plein écran sur l'écran choisi) et multiview (clics, clavier), rendu cadencé sur la fréquence de l'écran. |
@@ -185,6 +194,7 @@ Les fichiers vidéo sont lus par AVFoundation (tout format QuickTime/MP4 lisible
 | `src/audio.rs` | Énumération des périphériques (cpal), bus d'habillage (somme des sons des vidéos, pas de 10 ms), E/S CoreAudio : mixage/routage/VU-mètres dans le callback temps réel, pré-tampon et **compensation de dérive d'horloge** (ré-échantillonnage asservi au remplissage de l'anneau). |
 | `src/config.rs` | Modèle de configuration TOML. |
 | `web/` | Pages téléphone et contrôle (embarquées dans le binaire). |
+| `ios/` | App iOS native (SwiftUI + bibliothèque Rust) : voir `ios/README.md`. |
 
 Les fenêtres sont des surfaces wgpu ; la fenêtre programme suit l'écran HDMI choisi
 (`Fullscreen::Borderless`) et cadence le rendu de l'ensemble à la fréquence de cet écran.
@@ -286,7 +296,19 @@ disponibles dans `GET /api/state`.
 
 ## Tests
 
-Un test de bout en bout (Chromium headless avec caméra simulée) a été utilisé pendant le
-développement : offre/réponse SDP, connexion ICE, flux vidéo et audio décodés côté Rust,
-retour audio reçu par le navigateur, bascule de scènes via l'API. Le mode `--no-window` lance
-le moteur sans fenêtres (serveur, audio et API seulement).
+Un test de bout en bout (Chromium headless avec caméra simulée, `scripts/fake-phone.mjs`) a été
+utilisé pendant le développement : offre/réponse SDP, connexion ICE, flux vidéo et audio décodés
+côté Rust, retour audio reçu par le navigateur, bascule de scènes via l'API. Le mode
+`--no-window` lance le moteur sans fenêtres (serveur, audio et API seulement).
+
+Le même parcours existe en Rust pur, avec le code de l'app iOS (`crates/streame-rtc`, feature
+`client`) : mire animée encodée par VideoToolbox, micro synthétique, GCC, statistiques.
+
+```bash
+./target/debug/streame --no-window --config /tmp/bench.toml &     # bind 127.0.0.1:8444, audio.enabled = false
+HOLD=20 cargo run -p streame-rtc --features client --example fake_phone -- 127.0.0.1 8444
+curl -sk https://127.0.0.1:8444/api/state | jq .stats
+```
+
+`cargo test --workspace --all-features` couvre le protocole de signaling, les paramètres
+H264, l'offre SDP webrtc-rs et le ré-échantillonneur audio.
