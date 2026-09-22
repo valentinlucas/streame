@@ -14,10 +14,31 @@ pub struct Config {
     pub audio: AudioConfig,
     pub transition: TransitionConfig,
     pub streamdeck: StreamDeckConfig,
+    pub osc: OscConfig,
     pub scenes: Vec<SceneConfig>,
     /// Répertoire de base pour les chemins relatifs (renseigné au chargement).
     #[serde(skip)]
     pub base_dir: PathBuf,
+}
+
+/// Pilotage par OSC (UDP) : QLab (cues Réseau), Companion, TouchOSC… Mêmes actions que l'API
+/// HTTP : `/streame/program <id>`, `/streame/cut <id>`, `/streame/preview <id>`, `/streame/take`
+/// (l'identifiant peut aussi terminer l'adresse : `/streame/program/<id>`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OscConfig {
+    pub enabled: bool,
+    /// Adresse d'écoute UDP.
+    pub bind: String,
+}
+
+impl Default for OscConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: "0.0.0.0:53100".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,11 +322,36 @@ pub enum LayerConfig {
         #[serde(default = "one")]
         opacity: f64,
     },
-    /// Fichier vidéo (mp4, mov, webm...). `loop` = lecture en boucle.
+    /// Fichier vidéo (mp4, mov…). `loop` = le dernier fichier est lu en boucle.
+    ///
+    /// Générique puis boucle : soit deux fichiers (`path` lu une fois, puis `then` en boucle),
+    /// soit un seul avec une plage (`path` lu de 0 à `loop_to_ms`, puis boucle de
+    /// `loop_from_ms` à `loop_to_ms`). Dans ces deux cas la lecture (re)démarre au passage de la
+    /// scène à l'antenne et s'arrête en la quittant (`start = "on_air"`, le défaut) ; sinon elle
+    /// tourne dès le lancement (`start = "always"`, le défaut d'un simple fichier en boucle).
+    /// Les fichiers avec alpha (ProRes 4444…) sont détectés et superposés avec transparence.
     Video {
         path: String,
         #[serde(default = "yes", rename = "loop")]
         looped: bool,
+        /// Fichier lu en boucle après `path` (lu une fois).
+        #[serde(default)]
+        then: Option<String>,
+        /// Début de la boucle dans `path` (ms).
+        #[serde(default)]
+        loop_from_ms: Option<u64>,
+        /// Fin de la boucle dans `path` (ms) ; absent = fin du fichier.
+        #[serde(default)]
+        loop_to_ms: Option<u64>,
+        /// "on_air" ou "always" (voir ci-dessus).
+        #[serde(default)]
+        start: Option<String>,
+        /// Son du fichier envoyé à la carte (false = ignoré, par exemple si QLab le joue).
+        #[serde(default = "yes")]
+        audio: bool,
+        /// Force (ou interdit) le décodage avec alpha ; absent = détecté d'après le fichier.
+        #[serde(default)]
+        alpha: Option<bool>,
         #[serde(flatten)]
         geometry: Geometry,
         #[serde(default = "one")]
@@ -366,6 +412,38 @@ impl Config {
             }
             if s.name.is_empty() {
                 s.name = s.id.clone();
+            }
+        }
+        for sc in &self.scenes {
+            for l in &sc.layers {
+                if let LayerConfig::Video {
+                    then,
+                    loop_from_ms,
+                    loop_to_ms,
+                    start,
+                    ..
+                } = l
+                {
+                    anyhow::ensure!(
+                        then.is_none() || (loop_from_ms.is_none() && loop_to_ms.is_none()),
+                        "scène « {} » : `then` et `loop_from_ms`/`loop_to_ms` sont exclusifs",
+                        sc.id
+                    );
+                    if let (Some(a), Some(b)) = (loop_from_ms, loop_to_ms) {
+                        anyhow::ensure!(
+                            a < b,
+                            "scène « {} » : loop_from_ms doit précéder loop_to_ms",
+                            sc.id
+                        );
+                    }
+                    if let Some(st) = start {
+                        anyhow::ensure!(
+                            st == "on_air" || st == "always",
+                            "scène « {} » : start = \"{st}\" (attendu : on_air ou always)",
+                            sc.id
+                        );
+                    }
+                }
             }
         }
         let mut ids: Vec<&str> = self.scenes.iter().map(|s| s.id.as_str()).collect();
@@ -485,6 +563,12 @@ impl Config {
                     LayerConfig::Video {
                         path: "assets/overlay.mp4".into(),
                         looped: true,
+                        then: None,
+                        loop_from_ms: None,
+                        loop_to_ms: None,
+                        start: None,
+                        audio: true,
+                        alpha: None,
                         geometry: Geometry {
                             x: 1280,
                             y: 60,

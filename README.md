@@ -51,6 +51,15 @@ téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôl
 - **Contrôle distant** : `https://<ip>:8443/control` (tablette, second téléphone…) et API HTTP
   (`POST /api/program/<id>`, `/api/cut/<id>`, `/api/preview/<id>`, `/api/take`, `GET /api/state`),
   utilisable depuis Bitfocus Companion par exemple.
+- **Pilotage OSC (QLab)** : les mêmes actions en OSC sur UDP (`/streame/program <id>`,
+  `/streame/cut <id>`, `/streame/preview <id>`, `/streame/take`), pour qu'une conduite QLab
+  (cues Réseau, licence Audio suffisante) lance le son du générique et bascule les scènes vidéo
+  au même instant. Voir « Pilotage depuis QLab ».
+- **Génériques et boucles** : un calque vidéo peut lire un fichier une fois puis en boucler un
+  second (`then`), ou boucler une plage d'un seul fichier (`loop_from_ms`/`loop_to_ms`) ;
+  la lecture (re)démarre quand la scène passe à l'antenne et s'arrête quand elle la quitte.
+  Les fichiers avec **alpha** (ProRes 4444, HEVC alpha) sont détectés et superposés au
+  téléphone avec transparence ; `audio = false` ignore leur son (QLab le joue).
 - **Audio multicanal** : deux sources mélangées vers la carte son sur des canaux distincts.
   Le son de l'habillage (vidéos d'overlay) et le son du stream WebRTC vont chacun sur les canaux
   choisis de la Wing, et l'entrée choisie est renvoyée au téléphone.
@@ -133,7 +142,7 @@ output_device = "WING"        # "default", "none" ou sous-chaîne du nom (voir `
 input_device = "WING"
 output_channels = 0                # 0 = auto (nombre max de canaux du périphérique)
 input_channels = 0
-branding_output_channels = [1, 2]  # habillage stéréo → sorties 1/2 de la Wing
+branding_output_channels = [1, 2]  # habillage stéréo → sorties 1/2 de la Wing ([] = non routé, ex. son joué par QLab)
 stream_output_channels = [3, 4]    # stream WebRTC stéréo → sorties 3/4 (ou [3] pour mono)
 return_from_input_channels = [1]   # entrée 1 de la Wing → retour du téléphone
 meters = true                      # VU-mètres dans le panneau de contrôle
@@ -174,6 +183,56 @@ et, selon le type, `opacity`, `color` (`#RRGGBB` ou `#RRGGBBAA`), `font`, `loop`
 Les chemins relatifs sont résolus par rapport au fichier de configuration.
 Les fichiers vidéo sont lus par AVFoundation (tout format QuickTime/MP4 lisible par le système, H264/HEVC/ProRes…).
 
+Options du calque `video` :
+
+| Option | Effet |
+|---|---|
+| `loop` | le dernier fichier est lu en boucle (défaut `true`) |
+| `then` | fichier lu en boucle après `path`, lu une fois (générique puis boucle) |
+| `loop_from_ms`, `loop_to_ms` | un seul fichier : lu de 0 à `loop_to_ms`, puis boucle entre les deux bornes (`loop_to_ms` absent = fin) |
+| `start` | `on_air` : (re)démarre quand la scène passe à l'antenne, s'arrête en la quittant (défaut dès que `then` ou une plage est donné) ; `always` : tourne dès le lancement |
+| `audio` | `false` : son du fichier ignoré (par exemple joué par QLab) |
+| `alpha` | force (`true`) ou interdit (`false`) le décodage avec transparence ; absent = détecté d'après le fichier (ProRes 4444, HEVC alpha : BGRA, alpha direct) |
+
+```toml
+[[scenes]]
+id = "generique"
+name = "Générique"
+layers = [
+  { kind = "video", path = "assets/generique.mov", then = "assets/generique-boucle.mov", audio = false },
+]
+
+[[scenes]]
+id = "habillage-alpha"
+name = "Habillage alpha"
+layers = [
+  { kind = "phone" },
+  { kind = "video", path = "assets/habillage-intro.mov", then = "assets/habillage-boucle.mov", audio = false },
+]
+```
+
+## Pilotage depuis QLab
+
+QLab (licence Audio) joue le son et pilote streame en OSC : streame écoute en UDP sur
+`osc.bind` (défaut `0.0.0.0:53100`).
+
+1. Dans QLab, *Réglages de l'espace de travail → Réseau* : ajouter un patch **OSC**, protocole
+   UDP, adresse IP du Mac de régie (ou `127.0.0.1` si QLab tourne dessus), port `53100`.
+2. Créer un cue **Réseau** sur ce patch, type *message OSC*, avec par exemple :
+
+   | Message | Effet |
+   |---|---|
+   | `/streame/program generique` | passe la scène `generique` à l'antenne (transition configurée) |
+   | `/streame/cut black` | noir immédiat |
+   | `/streame/program 2` | deuxième scène de la configuration |
+   | `/streame/preview live` puis `/streame/take` | preview puis TAKE |
+
+3. Grouper ce cue avec le cue Audio du générique (démarrage simultané) : la scène démarre sa
+   vidéo au même instant, lit le générique une fois puis boucle jusqu'à la prochaine scène.
+   Redemander une scène déjà à l'antenne relance son générique.
+
+Les mêmes messages fonctionnent depuis Companion ou TouchOSC ; l'API HTTP reste disponible.
+
 ## Architecture
 
 | Module | Rôle |
@@ -209,8 +268,13 @@ disponibles dans `GET /api/state`.
   sur l'horloge murale (retard fixe de 80 ms pour s'aligner sur le son, qui traverse le bus et
   l'anneau de sortie), lit le son ~300 ms en avance et le pousse dans le bus d'habillage ; la
   boucle recrée le lecteur en conservant un temps continu (aucune coupure, 0 image sautée à 25
-  i/s sur un M4 Pro). Pas de couche alpha pour l'instant (sortie NV12) : les overlays avec
-  transparence passent par une image PNG ou un fond opaque.
+  i/s sur un M4 Pro). Un calque enchaîne des segments (générique puis boucle : deux fichiers ou
+  une plage d'un seul, via `AVAssetReader.timeRange`) et peut être piloté par l'antenne : le
+  lecteur reste armé sur la première image (décodée d'avance, visible en preview) pour un départ
+  instantané au passage à l'antenne, et le passage suivant est pré-ouvert pendant la lecture
+  (couture de boucle sans attente). Les
+  fichiers avec alpha sont décodés en BGRA (alpha direct, tel que livré par AVFoundation) et
+  mélangés par le shader ; les autres restent en NV12.
 - Pas d'enregistrement ni de streaming RTMP.
 - **Audio via CoreAudio (macOS)** : sur macOS, **toute la chaîne carte passe par CoreAudio (cpal)**.
   Le mixage des deux sources (stream du téléphone et habillage), leur routage sur les canaux

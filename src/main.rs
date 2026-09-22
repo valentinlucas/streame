@@ -12,6 +12,7 @@ mod discovery;
 mod engine;
 mod frame;
 mod layout;
+mod osc;
 mod render;
 mod server;
 mod streamdeck;
@@ -121,11 +122,18 @@ fn main() -> Result<()> {
     };
 
     let _deck = streamdeck::spawn(cfg.clone(), engine.clone());
+    let _osc = osc::spawn(cfg.clone(), engine.clone());
     engine.start()?;
     print_urls(&cfg, &ips);
     // Bonjour : l'app iOS découvre la régie sans saisir d'adresse.
     let _mdns = if cfg.server.mdns {
-        let port = cfg.server.bind.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(8443);
+        let port = cfg
+            .server
+            .bind
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8443);
         match discovery::Advertiser::start(&cfg, &ips, port) {
             Ok(a) => Some(a),
             Err(e) => {

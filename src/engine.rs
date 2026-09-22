@@ -158,6 +158,8 @@ pub struct Layer {
     pub kind: LayerKind,
     pub geometry: Geometry,
     pub opacity: f32,
+    /// Lecteur vidéo piloté par l'antenne (démarre quand la scène passe au programme).
+    pub player: Option<avf::PlayerCtl>,
 }
 
 pub struct Scene {
@@ -275,6 +277,14 @@ impl Engine {
         if let Some(bus) = bus {
             keepalive.push(Box::new(bus));
         }
+        // La scène programme initiale est à l'antenne : ses lecteurs démarrent.
+        if let Some(first) = scenes.first() {
+            for l in &first.layers {
+                if let Some(p) = &l.player {
+                    p.start();
+                }
+            }
+        }
 
         Ok(Arc::new(Engine {
             cfg: cfg.clone(),
@@ -310,6 +320,7 @@ impl Engine {
                 kind: LayerKind::Phone,
                 geometry: geometry.clone(),
                 opacity: *opacity as f32,
+                player: None,
             },
             LayerConfig::Color { color, geometry } => {
                 let c =
@@ -319,6 +330,7 @@ impl Engine {
                     kind: LayerKind::Color(color_to_f32(c)),
                     geometry: geometry.clone(),
                     opacity: 1.0,
+                    player: None,
                 }
             }
             LayerConfig::Text {
@@ -336,6 +348,7 @@ impl Engine {
                     kind: LayerKind::Text(Arc::new(img)),
                     geometry: geometry.clone(),
                     opacity: 1.0,
+                    player: None,
                 }
             }
             LayerConfig::Image {
@@ -352,32 +365,98 @@ impl Engine {
                     kind: LayerKind::Image(Arc::new(img)),
                     geometry: geometry.clone(),
                     opacity: *opacity as f32,
+                    player: None,
                 }
             }
             LayerConfig::Video {
                 path,
                 looped,
+                then,
+                loop_from_ms,
+                loop_to_ms,
+                start,
+                audio,
+                alpha,
                 geometry,
                 opacity,
             } => {
                 let file = cfg.resolve(path);
                 anyhow::ensure!(file.is_file(), "vidéo introuvable : {}", file.display());
+                let ms = |v: &Option<u64>| v.map(|m| m as f64 / 1000.0);
+                // Liste de lecture : générique + boucle (deux fichiers ou une plage), ou un
+                // simple fichier.
+                let mut segments = Vec::new();
+                let staged = then.is_some() || loop_from_ms.is_some() || loop_to_ms.is_some();
+                if let Some(then) = then {
+                    let loop_file = cfg.resolve(then);
+                    anyhow::ensure!(
+                        loop_file.is_file(),
+                        "vidéo introuvable : {}",
+                        loop_file.display()
+                    );
+                    segments.push(avf::Segment {
+                        path: file.clone(),
+                        from_s: 0.0,
+                        to_s: None,
+                        repeat: false,
+                    });
+                    segments.push(avf::Segment {
+                        path: loop_file,
+                        from_s: 0.0,
+                        to_s: None,
+                        repeat: *looped,
+                    });
+                } else if staged {
+                    let from = ms(loop_from_ms).unwrap_or(0.0);
+                    if from > 0.0 {
+                        segments.push(avf::Segment {
+                            path: file.clone(),
+                            from_s: 0.0,
+                            to_s: Some(from),
+                            repeat: false,
+                        });
+                    }
+                    segments.push(avf::Segment {
+                        path: file.clone(),
+                        from_s: from,
+                        to_s: ms(loop_to_ms),
+                        repeat: *looped,
+                    });
+                } else {
+                    segments.push(avf::Segment {
+                        path: file.clone(),
+                        from_s: 0.0,
+                        to_s: None,
+                        repeat: *looped,
+                    });
+                }
+                let on_air = match start.as_deref() {
+                    Some("on_air") => true,
+                    Some("always") => false,
+                    _ => staged,
+                };
                 let slot = Arc::new(FrameSlot::new());
                 // Décodage matériel par AVFoundation ; le son va au bus d'habillage (routé
                 // vers la carte), ou est ignoré sans sortie audio.
                 let player = avf::spawn(
-                    &file,
-                    *looped,
+                    avf::Playlist {
+                        segments,
+                        autostart: !on_air,
+                        audio: *audio,
+                        alpha: *alpha,
+                    },
                     slot.clone(),
                     bus.map(|b| b.add_input()),
                     cfg.audio.sample_rate as u32,
                 )?;
+                let ctl = on_air.then(|| player.ctl());
                 keepalive.push(Box::new(player));
                 Layer {
                     id,
                     kind: LayerKind::Video(slot),
                     geometry: geometry.clone(),
                     opacity: *opacity as f32,
+                    player: ctl,
                 }
             }
         })
@@ -399,13 +478,15 @@ impl Engine {
             },
             ..Default::default()
         };
+        // Canaux 1-based → indices 0-based ; liste vide = source non routée (aucun canal : le
+        // mixeur ignore les indices hors de la carte).
         let pair = |chans: &[usize]| {
-            let c0 = chans.first().copied().unwrap_or(1);
-            let c1 = chans.get(1).copied().unwrap_or(c0);
-            Arc::new([
-                AtomicUsize::new(c0.saturating_sub(1)),
-                AtomicUsize::new(c1.saturating_sub(1)),
-            ])
+            let c0 = chans
+                .first()
+                .map(|c| c.saturating_sub(1))
+                .unwrap_or(usize::MAX);
+            let c1 = chans.get(1).map(|c| c.saturating_sub(1)).unwrap_or(c0);
+            Arc::new([AtomicUsize::new(c0), AtomicUsize::new(c1)])
         };
         let meters_arc = Arc::new(audio::cpal_out::Meters::default());
 
@@ -508,10 +589,15 @@ impl Engine {
             _ => None,
         };
         let Some(sel) = sel else { return false };
-        let c0 = channels.first().copied().unwrap_or(1);
-        let c1 = channels.get(1).copied().unwrap_or(c0);
-        sel[0].store(c0.saturating_sub(1), Ordering::Relaxed);
-        sel[1].store(c1.saturating_sub(1), Ordering::Relaxed);
+        // Liste vide : sortie non routée (indice hors carte) ; le retour garde le canal 1.
+        let none = if target == "return" { 0 } else { usize::MAX };
+        let c0 = channels
+            .first()
+            .map(|c| c.saturating_sub(1))
+            .unwrap_or(none);
+        let c1 = channels.get(1).map(|c| c.saturating_sub(1)).unwrap_or(c0);
+        sel[0].store(c0, Ordering::Relaxed);
+        sel[1].store(c1, Ordering::Relaxed);
         let mut route = self.route.lock().unwrap();
         match target {
             "stream" => route.stream = channels.to_vec(),
@@ -742,12 +828,17 @@ impl Engine {
         let duration = self.cfg.transition.duration_ms;
         let fade =
             animated && self.cfg.transition.kind.eq_ignore_ascii_case("fade") && duration > 0;
+        let from_idx;
         {
             let mut st = self.state.lock().unwrap();
             if st.program == idx {
+                // Scène déjà à l'antenne, redemandée (cue rejouée) : on relance son générique.
+                drop(st);
+                self.arm_players(None, idx, Duration::ZERO);
                 return;
             }
             let from = st.program;
+            from_idx = from;
             st.program = idx;
             st.transition = if fade {
                 Some(Transition {
@@ -759,9 +850,35 @@ impl Engine {
                 None
             };
         }
+        self.arm_players(
+            Some(from_idx),
+            idx,
+            if fade {
+                Duration::from_millis(duration)
+            } else {
+                Duration::ZERO
+            },
+        );
         let _ = self.events.send(Event::Program {
             scene: self.scenes[idx].id.clone(),
         });
+    }
+
+    /// Démarre les lecteurs pilotés par l'antenne de la scène entrante et arrête ceux de la
+    /// sortante (après le fondu, pour qu'elle disparaisse en mouvement).
+    fn arm_players(&self, from: Option<usize>, to: usize, fade: Duration) {
+        if let Some(from) = from {
+            for l in &self.scenes[from].layers {
+                if let Some(p) = &l.player {
+                    p.stop_after(fade);
+                }
+            }
+        }
+        for l in &self.scenes[to].layers {
+            if let Some(p) = &l.player {
+                p.start();
+            }
+        }
     }
 
     /// Notifie la connexion/déconnexion du téléphone.

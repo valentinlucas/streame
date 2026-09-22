@@ -94,6 +94,17 @@ scene = ""
 label = "TAKE"
 color = ""
 
+# Pilotage OSC (UDP) depuis QLab (cues Réseau), Companion, TouchOSC… :
+#   /streame/program <id>   passage à l'antenne (transition)   ex. : /streame/program generique
+#   /streame/cut <id>       bascule immédiate
+#   /streame/preview <id>   preview
+#   /streame/take           preview → programme
+# L'identifiant peut aussi terminer l'adresse (/streame/program/generique) ou être un entier
+# (numéro de scène à partir de 1). Une scène déjà à l'antenne redemandée relance son générique.
+[osc]
+enabled = true
+bind = "0.0.0.0:53100"
+
 [[scenes]]
 id = "black"
 name = "Noir"
@@ -160,3 +171,38 @@ y = 60
 width = 576
 height = 324
 opacity = 0.9
+
+# Générique lu une fois puis boucle, (re)démarrés quand la scène passe à l'antenne (cue QLab),
+# arrêtés quand elle la quitte. Son ignoré (QLab joue le générique). Deux fichiers…
+[[scenes]]
+id = "generique"
+name = "Générique"
+
+[[scenes.layers]]
+kind = "video"
+path = "assets/generique.mov"
+then = "assets/generique-boucle.mov"
+audio = false
+
+# … ou un seul fichier : lu de 0 à loop_to_ms, puis boucle entre loop_from_ms et loop_to_ms
+# (loop_to_ms absent = fin du fichier).
+#[[scenes.layers]]
+#kind = "video"
+#path = "assets/generique.mov"
+#loop_from_ms = 12000
+#audio = false
+
+# Habillage ProRes 4444 avec alpha (détecté automatiquement) superposé au téléphone : générique
+# puis boucle, comme ci-dessus.
+[[scenes]]
+id = "habillage-alpha"
+name = "Habillage alpha"
+
+[[scenes.layers]]
+kind = "phone"
+
+[[scenes.layers]]
+kind = "video"
+path = "assets/habillage-intro.mov"
+then = "assets/habillage-boucle.mov"
+audio = false

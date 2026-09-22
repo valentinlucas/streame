@@ -41,6 +41,9 @@ wgpu = "30"
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
 
+# Pilotage OSC (UDP) depuis QLab, Companion…
+rosc = "0.11"
+
 # Stream Deck
 elgato-streamdeck = "0.13"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
