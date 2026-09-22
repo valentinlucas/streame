@@ -37,8 +37,15 @@ impl Advertiser {
         };
         let addrs: Vec<std::net::IpAddr> = ips.iter().filter_map(|s| s.parse().ok()).collect();
         let props = [("path", "/ws"), ("version", env!("CARGO_PKG_VERSION"))];
-        let info = ServiceInfo::new(SERVICE_TYPE, &name, &format!("{host}.local."), &addrs[..], port, &props[..])
-            .context("description du service Bonjour")?;
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &name,
+            &format!("{host}.local."),
+            &addrs[..],
+            port,
+            &props[..],
+        )
+        .context("description du service Bonjour")?;
         let fullname = info.get_fullname().to_string();
         daemon.register(info).context("enregistrement Bonjour")?;
         info!("Bonjour : « {name} » annoncé ({SERVICE_TYPE} port {port})");

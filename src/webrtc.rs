@@ -49,8 +49,8 @@ use webrtc::peer_connection::{
 };
 
 // Code partagé avec l'app iOS (crates/streame-rtc) : protocole, PeerConnection, Opus, H264.
-pub use streame_rtc::signaling::{ClientMsg, ServerMsg};
 use streame_rtc::h264::{announce_start_bitrate, video_codec_preferences};
+pub use streame_rtc::signaling::{ClientMsg, ServerMsg};
 use streame_rtc::{opus, pc};
 
 pub struct PhoneSession {
@@ -134,7 +134,10 @@ impl PeerConnectionEventHandler for Handler {
     }
 
     async fn on_ice_candidate_error(&self, event: RTCPeerConnectionIceErrorEvent) {
-        warn!("téléphone « {} » : erreur de candidat ICE : {event:?}", self.name);
+        warn!(
+            "téléphone « {} » : erreur de candidat ICE : {event:?}",
+            self.name
+        );
     }
 
     async fn on_signaling_state_change(&self, state: RTCSignalingState) {
@@ -149,10 +152,15 @@ impl PeerConnectionEventHandler for Handler {
             .as_ref()
             .map(|c| c.mime_type.to_lowercase())
             .unwrap_or_default();
-        let clock_rate = codec
-            .as_ref()
-            .map(|c| c.clock_rate)
-            .unwrap_or(if kind == RtpCodecKind::Audio { 48000 } else { 90000 });
+        let clock_rate =
+            codec
+                .as_ref()
+                .map(|c| c.clock_rate)
+                .unwrap_or(if kind == RtpCodecKind::Audio {
+                    48000
+                } else {
+                    90000
+                });
         info!("piste {kind:?} « {mime} » du téléphone (ssrc {media_ssrc}, {clock_rate} Hz)");
 
         // Audio : décodage Opus direct (libopus) → mixeur cpal.
@@ -235,9 +243,13 @@ impl PeerConnectionEventHandler for Handler {
                     }
                     let now = Instant::now();
                     let since = now.duration_since(last_pli);
-                    let reason = if keyframe_needed.swap(false, Ordering::Relaxed) && since >= Duration::from_millis(300) {
+                    let reason = if keyframe_needed.swap(false, Ordering::Relaxed)
+                        && since >= Duration::from_millis(300)
+                    {
                         Some(("discontinuité (perte ou erreur de décodage)", true))
-                    } else if engine.phone_slot().fps.value() <= 0.0 && since >= Duration::from_secs(2) {
+                    } else if engine.phone_slot().fps.value() <= 0.0
+                        && since >= Duration::from_secs(2)
+                    {
                         Some(("plus aucune image décodée", true))
                     } else if interval > 0 && since >= Duration::from_secs(interval as u64) {
                         Some(("image-clé de sécurité périodique", false))
@@ -274,11 +286,18 @@ impl Handler {
             return;
         };
         if n > 2 {
-            warn!("téléphone « {} » : ICE en échec après {} redémarrages, session fermée", self.name, n - 1);
+            warn!(
+                "téléphone « {} » : ICE en échec après {} redémarrages, session fermée",
+                self.name,
+                n - 1
+            );
             self.cancel.cancel();
             return;
         }
-        warn!("téléphone « {} » : ICE en échec, redémarrage ICE ({n}/2)", self.name);
+        warn!(
+            "téléphone « {} » : ICE en échec, redémarrage ICE ({n}/2)",
+            self.name
+        );
         let out = self.out.clone();
         let cancel = self.cancel.clone();
         let connected = self.connected.clone();
@@ -374,7 +393,8 @@ impl PhoneSession {
         *pc_slot.lock().unwrap() = Some(pc.clone());
 
         // --- Audio retour : piste locale Opus (envoyée vers le téléphone) ---------------------
-        let (return_track, ssrc) = opus::new_local_track("streame-return", "return-audio", "return")?;
+        let (return_track, ssrc) =
+            opus::new_local_track("streame-return", "return-audio", "return")?;
         // Audio en sendrecv (envoi du retour + réception du micro du téléphone).
         let sender = pc
             .add_track(return_track.clone() as Arc<dyn TrackLocal>)
@@ -525,7 +545,8 @@ fn spawn_native_h264(
                 };
                 let Some((arrived, frame)) = item else { break };
                 if !offset.is_zero() {
-                    tokio::time::sleep_until(tokio::time::Instant::from_std(arrived + offset)).await;
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(arrived + offset))
+                        .await;
                 }
                 engine.phone_slot().push(frame);
             }

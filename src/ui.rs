@@ -236,7 +236,14 @@ impl App {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             let (s, m) = (ms / 1000 % 86400, ms % 1000);
-            format!("{} · {:02}:{:02}:{:02}.{:03} UTC", self.stats_text, s / 3600, s / 60 % 60, s % 60, m)
+            format!(
+                "{} · {:02}:{:02}:{:02}.{:03} UTC",
+                self.stats_text,
+                s / 3600,
+                s / 60 % 60,
+                s % 60,
+                m
+            )
         } else {
             self.stats_text.clone()
         };

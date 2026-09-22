@@ -6,17 +6,17 @@
 use crate::config::Geometry;
 use crate::engine::{Engine, LayerKind, RenderState, NO_PHONE_TEXT};
 use crate::frame::{FrameSlot, PixelFormat, SurfaceFrame};
+use crate::layout::{self, Rect};
+use crate::text;
+use anyhow::{anyhow, Context, Result};
+use bytemuck::{Pod, Zeroable};
+use image::RgbaImage;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTextureDescriptor, MTLTextureType,
     MTLTextureUsage,
 };
-use crate::layout::{self, Rect};
-use crate::text;
-use anyhow::{anyhow, Context, Result};
-use bytemuck::{Pod, Zeroable};
-use image::RgbaImage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -470,7 +470,9 @@ impl Renderer {
                 None,
             )
         };
-        Self::wrap_tex(device, layout, uniforms, sampler, width, height, kind, tex0, tex1, None)
+        Self::wrap_tex(
+            device, layout, uniforms, sampler, width, height, kind, tex0, tex1, None,
+        )
     }
 
     /// Enveloppe des textures déjà créées (allouées par wgpu ou importées d'une IOSurface) dans
@@ -564,7 +566,8 @@ impl Renderer {
             };
             desc.setUsage(MTLTextureUsage::ShaderRead);
             desc.setStorageMode(MTLStorageMode::Shared);
-            let raw = raw_dev.newTextureWithDescriptor_iosurface_plane(&desc, &sf.surface, plane)?;
+            let raw =
+                raw_dev.newTextureWithDescriptor_iosurface_plane(&desc, &sf.surface, plane)?;
             let keep = sf.clone();
             let hal = unsafe {
                 wgpu::hal::metal::Device::texture_from_raw(
@@ -573,36 +576,66 @@ impl Renderer {
                     MTLTextureType::Type2D,
                     1,
                     1,
-                    wgpu::hal::CopyExtent { width: w, height: h, depth: 1 },
+                    wgpu::hal::CopyExtent {
+                        width: w,
+                        height: h,
+                        depth: 1,
+                    },
                     Some(Box::new(move || drop(keep))),
                 )
             };
             Some(unsafe {
-                self.device.create_texture_from_hal::<wgpu::hal::api::Metal>(
-                    hal,
-                    &wgpu::TextureDescriptor {
-                        label: Some(label),
-                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: fmt_wgpu,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    },
-                    wgpu::TextureUses::RESOURCE,
-                )
+                self.device
+                    .create_texture_from_hal::<wgpu::hal::api::Metal>(
+                        hal,
+                        &wgpu::TextureDescriptor {
+                            label: Some(label),
+                            size: wgpu::Extent3d {
+                                width: w,
+                                height: h,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: fmt_wgpu,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        },
+                        wgpu::TextureUses::RESOURCE,
+                    )
             })
         };
         // BGRA : le format de texture Metal fait la permutation, le shader reçoit du RGBA.
         let (tex0, tex1, kind) = match sf.format {
             PixelFormat::Nv12 => (
-                make(MTLPixelFormat::R8Unorm, wgpu::TextureFormat::R8Unorm, sf.width, sf.height, 0, "iosurface-y"),
-                make(MTLPixelFormat::RG8Unorm, wgpu::TextureFormat::Rg8Unorm, sf.width.div_ceil(2), sf.height.div_ceil(2), 1, "iosurface-uv"),
+                make(
+                    MTLPixelFormat::R8Unorm,
+                    wgpu::TextureFormat::R8Unorm,
+                    sf.width,
+                    sf.height,
+                    0,
+                    "iosurface-y",
+                ),
+                make(
+                    MTLPixelFormat::RG8Unorm,
+                    wgpu::TextureFormat::Rg8Unorm,
+                    sf.width.div_ceil(2),
+                    sf.height.div_ceil(2),
+                    1,
+                    "iosurface-uv",
+                ),
                 KIND_NV12,
             ),
             PixelFormat::Bgra => (
-                make(MTLPixelFormat::BGRA8Unorm, wgpu::TextureFormat::Bgra8Unorm, sf.width, sf.height, 0, "iosurface-bgra"),
+                make(
+                    MTLPixelFormat::BGRA8Unorm,
+                    wgpu::TextureFormat::Bgra8Unorm,
+                    sf.width,
+                    sf.height,
+                    0,
+                    "iosurface-bgra",
+                ),
                 None,
                 KIND_RGBA,
             ),
@@ -612,8 +645,16 @@ impl Renderer {
             return false;
         }
         let gt = Self::wrap_tex(
-            &self.device, &self.layout, &self.uniforms, &self.sampler,
-            sf.width, sf.height, kind, tex0, tex1, Some(sf.surface_id),
+            &self.device,
+            &self.layout,
+            &self.uniforms,
+            &self.sampler,
+            sf.width,
+            sf.height,
+            kind,
+            tex0,
+            tex1,
+            Some(sf.surface_id),
         );
         self.textures.insert(key, gt);
         true

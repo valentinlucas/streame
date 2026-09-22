@@ -199,7 +199,8 @@ impl H264Decoder {
         let format = format_description(&self.sps, &self.pps)?;
         let attrs = destination_attributes();
         // Le dictionnaire typé a la même représentation que le dictionnaire opaque attendu.
-        let attrs_ref: &CFDictionary = unsafe { &*CFRetained::as_ptr(&attrs).cast::<CFDictionary>().as_ptr() };
+        let attrs_ref: &CFDictionary =
+            unsafe { &*CFRetained::as_ptr(&attrs).cast::<CFDictionary>().as_ptr() };
         let record = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(on_frame),
             decompressionOutputRefCon: Arc::as_ptr(&self.sink) as *mut c_void,
