@@ -36,9 +36,10 @@ use tracing::{error, info, warn};
     about = "Régie vidéo : téléphone (WebRTC) → HDMI, scènes, multiview, Stream Deck"
 )]
 struct Cli {
-    /// Fichier de configuration TOML.
-    #[arg(short, long, default_value = "streame.toml")]
-    config: PathBuf,
+    /// Fichier de configuration TOML. Défaut : `streame.toml` dans le dossier courant s'il
+    /// existe, sinon `~/Library/Application Support/streame/streame.toml`.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
     /// Pas de fenêtres (serveur, audio et API seulement) — tests sans écran.
     #[arg(long)]
@@ -64,19 +65,21 @@ fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let config_path = cli.config.clone().unwrap_or_else(default_config_path);
 
     match cli.command {
-        Some(Command::Init) => return cmd_init(&cli.config),
+        Some(Command::Init) => return cmd_init(&config_path),
         Some(Command::Devices) => return cmd_devices(),
         None => {}
     }
 
-    let cfg = Arc::new(if cli.config.is_file() {
-        Config::load(&cli.config)?
+    let cfg = Arc::new(if config_path.is_file() {
+        info!("configuration : {}", config_path.display());
+        Config::load(&config_path)?
     } else {
         warn!(
             "{} introuvable : configuration par défaut (voir `streame init`)",
-            cli.config.display()
+            config_path.display()
         );
         let mut c = Config::default();
         c.validate()?;
@@ -213,8 +216,28 @@ fn print_urls(cfg: &Config, ips: &[String]) {
     println!();
 }
 
+/// Configuration par défaut : `streame.toml` dans le dossier courant (usage en ligne de
+/// commande, dépôt de dev), sinon le dossier utilisateur standard de macOS, où l'app installée
+/// (Streame.app, lancée depuis le Finder avec `/` pour dossier courant) range aussi ses
+/// certificats et ses vidéos.
+fn default_config_path() -> PathBuf {
+    let local = PathBuf::from("streame.toml");
+    if local.is_file() {
+        return local;
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join("Library/Application Support/streame")
+            .join("streame.toml"),
+        None => local,
+    }
+}
+
 fn cmd_init(path: &std::path::Path) -> Result<()> {
     anyhow::ensure!(!path.exists(), "{} existe déjà", path.display());
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
     let cfg = Config::example();
     let text = toml::to_string_pretty(&cfg)?;
     std::fs::write(path, format!("{}\n{}", EXAMPLE_HEADER, text))?;

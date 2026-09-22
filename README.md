@@ -105,8 +105,23 @@ Au démarrage, l'URL du téléphone est affichée avec un QR code. Le certificat
 (la caméra exige HTTPS) : sur iPhone, accepter l'avertissement Safari (« Afficher les détails »
 → « visiter ce site web »). Le certificat est stocké dans `certs/` et réutilisé.
 
-Options : `--config <fichier>` (défaut `streame.toml`), `--no-window` (serveur, audio et API
-seulement, sans fenêtres), `RUST_LOG=info,streame=debug` pour plus de traces.
+Options : `--config <fichier>`, `--no-window` (serveur, audio et API seulement, sans fenêtres),
+`RUST_LOG=info,streame=debug` pour plus de traces. Sans `--config`, streame lit `streame.toml`
+dans le dossier courant s'il existe, sinon `~/Library/Application Support/streame/streame.toml`.
+
+### Application macOS (Streame.app)
+
+```bash
+scripts/bundle-macos.sh --install        # cargo build --release + icône + /Applications/Streame.app
+```
+
+Le bundle (binaire autonome, icône `assets/icon/streame.svg` rendue en `.icns`, signature ad hoc)
+se lance depuis le Finder ou Spotlight. Il range tout dans
+`~/Library/Application Support/streame/` : `streame.toml`, `certs/` (garder les mêmes fichiers
+pour que le téléphone continue de faire confiance au certificat) et les vidéos référencées par
+la configuration (chemins relatifs à ce dossier). Le journal est écrit dans
+`~/Library/Logs/streame.log` (le lancement précédent dans `streame.previous.log`). Au premier
+lancement, macOS demande l'accès au micro (carte son) et au réseau local.
 
 ## Configuration (`streame.toml`)
 
