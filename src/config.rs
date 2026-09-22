@@ -130,7 +130,11 @@ impl Default for VideoConfig {
 pub struct OutputConfig {
     /// Écran de sortie programme : sous-chaîne du nom de l'écran ("HDMI", "LG", ...)
     /// ou index numérique. Vide = écran secondaire s'il existe, sinon l'écran principal.
+    /// Si l'écran nommé est absent, la sortie reste en fenêtre et s'y place dès qu'il est
+    /// branché ; elle suit aussi les débranchements et rebranchements.
     pub display: String,
+    /// Couvre l'écran choisi (sans bordure, au-dessus de tout, curseur masqué, veille bloquée).
+    /// Touche F pour basculer, Échap pour revenir en fenêtre.
     pub fullscreen: bool,
 }
 

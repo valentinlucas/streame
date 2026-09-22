@@ -40,7 +40,9 @@ téléphone. Pilotage par Stream Deck, multiview cliquable, page web de contrôl
   livrent des images NV12 en **IOSurface** que wgpu/Metal importe directement comme textures —
   le CPU ne touche jamais aux pixels. Composition, fondus et multiview sur le GPU à la
   fréquence de l'écran (NV12 → RGB dans le shader).
-- **Sortie HDMI** : fenêtre plein écran sur l'écran de votre choix (nom ou index).
+- **Sortie HDMI** : comme une régie vidéo (QLab, Resolume) : la sortie couvre l'écran de votre choix
+  (nom ou index) au-dessus de tout, sans bordure ni curseur, veille bloquée ; elle se place toute
+  seule sur le projecteur quand il est branché ou rebranché.
 - **Scènes** : calques `phone` (flux du téléphone), `color`, `image` (PNG avec transparence),
   `video` (fichier, en boucle, avec opacité) et `text`. Exemples fournis : noir, direct, habillage
   d'antenne, overlay vidéo.
@@ -143,8 +145,9 @@ width = 1920                  # taille du canevas des scènes (la sortie suit l'
 height = 1080
 
 [output]
-display = "HDMI"              # sous-chaîne du nom de l'écran, ou index (voir `streame devices`)
-fullscreen = true
+display = "HDMI"              # sous-chaîne du nom de l'écran, ou index (voir `streame devices`) ;
+                              # absent = sortie en fenêtre jusqu'à son branchement
+fullscreen = true             # couvre l'écran (F pour basculer, Échap pour revenir en fenêtre)
 
 [multiview]
 enabled = true
@@ -262,7 +265,7 @@ Les mêmes messages fonctionnent depuis Companion ou TouchOSC ; l'API HTTP reste
 | `src/discovery.rs` | Annonce Bonjour `_streame._tcp` (mdns-sd) pour que l'app iOS trouve la régie. |
 | `src/webrtc.rs` | Une session **webrtc-rs** par téléphone (le Mac fait l'offre, H264 seul) : ICE/DTLS/SRTP/RTP et TWCC/NACK en Rust. Vidéo : RTP → thread `h264-decode` (remise en ordre + dépaquetisation H264 par `SampleBuilder`) → `vt.rs` → IOSurface → GPU. Audio : décodage Opus par **libopus** (PLC/FEC) → mixeur cpal ; retour encodé par libopus au rythme de la carte, écrit sur la piste locale. Image-clé demandée par rafale au démarrage puis à la demande (perte, erreur, famine, filet périodique). |
 | `src/server.rs` | Serveur HTTPS axum : page téléphone, WebSocket de signaling, page/WebSocket de contrôle, API REST (avec statistiques). |
-| `src/ui.rs` | Fenêtres winit : programme (plein écran sur l'écran choisi) et multiview (clics, clavier), rendu cadencé sur la fréquence de l'écran. |
+| `src/ui.rs` | Fenêtres winit : programme (couvre l'écran choisi : niveau économiseur d'écran, tous les bureaux, curseur masqué, veille bloquée ; suit les branchements d'écran) et multiview (clics, clavier), rendu cadencé sur la fréquence de l'écran. |
 | `src/streamdeck.rs` | Thread Stream Deck (hidapi) : rendu des touches, actions, reconnexion. |
 | `src/text.rs` | Rendu de texte (police DejaVu embarquée) pour les libellés et les touches. |
 | `src/audio.rs` | Énumération des périphériques (cpal), bus d'habillage (somme des sons des vidéos, pas de 10 ms), E/S CoreAudio : mixage/routage/VU-mètres dans le callback temps réel, pré-tampon et **compensation de dérive d'horloge** (ré-échantillonnage asservi au remplissage de l'anneau). |
@@ -270,8 +273,14 @@ Les mêmes messages fonctionnent depuis Companion ou TouchOSC ; l'API HTTP reste
 | `web/` | Pages téléphone et contrôle (embarquées dans le binaire). |
 | `ios/` | App iOS native (SwiftUI + bibliothèque Rust) : voir `ios/README.md`. |
 
-Les fenêtres sont des surfaces wgpu ; la fenêtre programme suit l'écran HDMI choisi
-(`Fullscreen::Borderless`) et cadence le rendu de l'ensemble à la fréquence de cet écran.
+Les fenêtres sont des surfaces wgpu ; la fenêtre programme suit l'écran HDMI choisi et cadence
+le rendu de l'ensemble à la fréquence de cet écran. Sur un écran secondaire, c'est une fenêtre
+AppKit sans bordure plaquée sur le cadre exact de l'écran, au niveau économiseur d'écran, présente
+sur tous les bureaux (pas de transition Spaces, pas de barre de menus), curseur masqué ; la veille
+est bloquée par `NSProcessInfo.beginActivity`. macOS n'offre pas d'accès exclusif à un écran :
+c'est le même mécanisme que QLab. Les écrans sont relevés chaque seconde : si l'écran nommé est
+absent la sortie reste en fenêtre, et elle se replace dès qu'il apparaît. Sur l'écran principal
+(pas de second écran), plein écran winit classique pour ne pas enfermer l'opérateur.
 Le multiview affiche les statistiques (résolution et i/s du téléphone, i/s du rendu), aussi
 disponibles dans `GET /api/state`.
 

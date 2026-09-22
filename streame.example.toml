@@ -21,7 +21,10 @@ mixer_latency_ms = 60
 av_offset_ms = 80
 
 [output]
+# Écran de sortie (nom ou index, voir `streame devices`). Absent = sortie en fenêtre jusqu'à
+# son branchement ; la fenêtre suit les débranchements et rebranchements.
 display = "HDMI"
+# Couvre l'écran : sans bordure, au-dessus de tout, curseur masqué, veille bloquée (F / Échap).
 fullscreen = true
 
 [multiview]
